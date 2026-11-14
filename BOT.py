@@ -722,6 +722,8 @@ class QuestionPanel(discord.ui.View):
         self.mention_text: str | None = None  # texte envoyé avec la question
         self.mention_label = ""               # version courte pour le bouton
         self.mention_warning: str | None = None
+        self.chosen_roles: list = []  # rôles choisis dans le menu de mention
+        self.chosen_users: list = []  # personnes choisies dans le menu de mention
         self.in_picker = False
         self._waiting_file = False
         self._sync_buttons()
@@ -965,7 +967,7 @@ class QuestionPanel(discord.ui.View):
 
 
 class MentionPicker(discord.ui.View):
-    """Choix de la mention : rôles / personnes (menu), @everyone, @here ou aucune."""
+    """Choix de la mention : rôles du serveur, personnes, @everyone, @here ou aucune."""
 
     def __init__(self, panel: QuestionPanel) -> None:
         super().__init__(timeout=600)
@@ -975,9 +977,11 @@ class MentionPicker(discord.ui.View):
         embed = discord.Embed(
             title="🔔 Choisir la mention",
             description=(
-                "Choisis qui sera mentionné quand la question est postée :\n"
-                "• le **menu** : un ou plusieurs rôles / personnes\n"
-                "• les **boutons** : `@everyone`, `@here` ou aucune mention"
+                "Compose la mention que tu veux :\n"
+                "• **Rôles du serveur** : un ou plusieurs rôles (ex. `@Quiz`, `@Membres`)\n"
+                "• **Personnes** : une ou plusieurs personnes\n"
+                "• Les deux menus se **combinent** ; chaque menu remplace son choix précédent\n"
+                "• `@everyone` et `@here` remplacent tout le reste"
             ),
             color=discord.Color.blurple(),
         )
@@ -987,32 +991,57 @@ class MentionPicker(discord.ui.View):
     async def _refresh(self, interaction: discord.Interaction) -> None:
         await interaction.response.edit_message(embed=self.build_embed(), view=self)
 
+    def _apply(self) -> None:
+        """Met à jour la mention du panneau avec les rôles et personnes choisis."""
+        self.panel.set_mention_from_selection([*self.panel.chosen_roles, *self.panel.chosen_users])
+
+    def _clear_choices(self) -> None:
+        self.panel.chosen_roles = []
+        self.panel.chosen_users = []
+
     @discord.ui.select(
-        cls=discord.ui.MentionableSelect,
-        placeholder="Rôles ou personnes à mentionner",
+        cls=discord.ui.RoleSelect,
+        placeholder="Rôles du serveur à mentionner",
         min_values=1,
-        max_values=5,
+        max_values=25,
+        row=0,
     )
-    async def pick(self, interaction: discord.Interaction, select: discord.ui.MentionableSelect) -> None:
-        self.panel.set_mention_from_selection(list(select.values))
+    async def pick_roles(self, interaction: discord.Interaction, select: discord.ui.RoleSelect) -> None:
+        self.panel.chosen_roles = list(select.values)
+        self._apply()
         await self._refresh(interaction)
 
-    @discord.ui.button(label="@everyone", style=discord.ButtonStyle.secondary)
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="Personnes à mentionner",
+        min_values=1,
+        max_values=10,
+        row=1,
+    )
+    async def pick_users(self, interaction: discord.Interaction, select: discord.ui.UserSelect) -> None:
+        self.panel.chosen_users = list(select.values)
+        self._apply()
+        await self._refresh(interaction)
+
+    @discord.ui.button(label="@everyone", style=discord.ButtonStyle.secondary, row=2)
     async def everyone_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._clear_choices()
         self.panel.set_mention("@everyone", "@everyone", needs_everyone_perm=True)
         await self._refresh(interaction)
 
-    @discord.ui.button(label="@here", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="@here", style=discord.ButtonStyle.secondary, row=2)
     async def here_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._clear_choices()
         self.panel.set_mention("@here", "@here", needs_everyone_perm=True)
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Aucune mention", emoji="🔕", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="Aucune mention", emoji="🔕", style=discord.ButtonStyle.secondary, row=2)
     async def none_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self._clear_choices()
         self.panel.set_mention(None)
         await self._refresh(interaction)
 
-    @discord.ui.button(label="Terminé", emoji="✅", style=discord.ButtonStyle.success)
+    @discord.ui.button(label="Terminé", emoji="✅", style=discord.ButtonStyle.success, row=2)
     async def done_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         self.panel.in_picker = False
         self.stop()
@@ -1682,8 +1711,9 @@ def main() -> None:
         from keep_alive import keep_alive  # facultatif : utile sur Replit
 
         keep_alive()
-    except ImportError:
-        log.info("keep_alive.py ou Flask absent : le serveur « keep alive » n'est pas lancé.")
+    except ImportError as err:
+        # Le message entre parenthèses donne la vraie raison : « flask » ou « keep_alive » introuvable.
+        log.warning("Keep alive non lancé (%s). Le bot démarre quand même.", err)
     QuizBot().run(TOKEN, log_handler=None)
 
 
