@@ -1,4 +1,6 @@
-ultidict==6.7.0
+discord.py>=2.6
+flask
+multidict==6.7.0
 packaging==26.0
 platformdirs==4.9.6
 propcache==0.4.1
