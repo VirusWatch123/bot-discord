@@ -280,6 +280,11 @@ class Database:
                     content_type TEXT,
                     data         BLOB    NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS guild_admins (
+                    guild_id    INTEGER NOT NULL,
+                    user_id     INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                );
                 CREATE TABLE IF NOT EXISTS authorized_users (
                     user_id     INTEGER PRIMARY KEY
                 );
@@ -546,6 +551,30 @@ class Database:
 
     def list_authorized(self) -> list[int]:
         return [r["user_id"] for r in self.conn.execute("SELECT user_id FROM authorized_users ORDER BY rowid")]
+
+    def add_guild_admin(self, guild_id: int, user_id: int) -> bool:
+        """Accès aux commandes sur CE serveur uniquement (personne qui a ajouté le bot)."""
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO guild_admins (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id)
+            )
+        return cur.rowcount == 1
+
+    def is_guild_admin(self, guild_id: int, user_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM guild_admins WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        ).fetchone()
+        return row is not None
+
+    def has_guild_admin(self, guild_id: int) -> bool:
+        row = self.conn.execute("SELECT 1 FROM guild_admins WHERE guild_id = ?", (guild_id,)).fetchone()
+        return row is not None
+
+    def has_access(self, user_id: int, guild_id: int | None) -> bool:
+        """Propriétaire, personnes ajoutées avec /add, ou personne qui a ajouté le bot sur ce serveur."""
+        if user_id == OWNER_ID or self.is_authorized(user_id):
+            return True
+        return guild_id is not None and self.is_guild_admin(guild_id, user_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -1109,11 +1138,11 @@ class ConfirmResetView(discord.ui.View):
 # Cog principal
 # --------------------------------------------------------------------------- #
 def authorized_only():
-    """Réservé au propriétaire et aux personnes ajoutées avec /add."""
+    """Réservé au propriétaire, aux personnes ajoutées avec /add et à celle qui a ajouté le bot sur le serveur."""
 
     async def predicate(interaction: discord.Interaction) -> bool:
-        user_id = interaction.user.id
-        return user_id == OWNER_ID or interaction.client.db.is_authorized(user_id)  # type: ignore[attr-defined]
+        db = interaction.client.db  # type: ignore[attr-defined]
+        return db.has_access(interaction.user.id, interaction.guild_id)
 
     return app_commands.check(predicate)
 
@@ -1650,6 +1679,34 @@ class Quiz(commands.Cog):
         if await self.post_question(guild_id, channel, row):
             days_left -= 1
         self.db.update_schedule_after_post(guild_id, today, days_left, enabled=days_left > 0)
+
+    # ------------------- Accès pour la personne qui ajoute le bot ----------- #
+    async def register_inviter(self, guild: discord.Guild) -> None:
+        """Donne accès aux commandes (sur ce serveur) à la personne qui a ajouté le bot,
+        sinon au propriétaire du serveur."""
+        inviter_id = None
+        try:
+            async for entry in guild.audit_logs(limit=25, action=discord.AuditLogAction.bot_add):
+                if entry.target is not None and entry.target.id == self.bot.user.id:  # type: ignore[union-attr]
+                    inviter_id = entry.user_id
+                    break
+        except (discord.Forbidden, discord.HTTPException):
+            log.info("Logs du serveur illisibles sur %s (permission manquante) : accès donné au propriétaire.", guild.id)
+        if inviter_id is None:
+            inviter_id = guild.owner_id
+        if inviter_id and self.db.add_guild_admin(guild.id, inviter_id):
+            log.info("Accès aux commandes donné à %s sur le serveur %s", inviter_id, guild.id)
+
+    @commands.Cog.listener()
+    async def on_guild_join(self, guild: discord.Guild) -> None:
+        await self.register_inviter(guild)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        # Serveurs où le bot était déjà présent : on prépare l'accès s'il n'existe pas encore.
+        for guild in self.bot.guilds:
+            if not self.db.has_guild_admin(guild.id):
+                await self.register_inviter(guild)
 
     # ------------------------------ Écoute du chat ------------------------- #
     @commands.Cog.listener()
