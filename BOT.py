@@ -280,6 +280,11 @@ class Database:
                     content_type TEXT,
                     data         BLOB    NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS guild_helpers (
+                    guild_id    INTEGER NOT NULL,
+                    user_id     INTEGER NOT NULL,
+                    PRIMARY KEY (guild_id, user_id)
+                );
                 CREATE TABLE IF NOT EXISTS guild_admins (
                     guild_id    INTEGER NOT NULL,
                     user_id     INTEGER NOT NULL,
@@ -534,26 +539,10 @@ class Database:
             self.conn.execute("UPDATE schedule SET enabled = 0 WHERE guild_id = ?", (guild_id,))
 
     # -- accès ------------------------------------------------------------- #
-    def is_authorized(self, user_id: int) -> bool:
-        row = self.conn.execute("SELECT 1 FROM authorized_users WHERE user_id = ?", (user_id,)).fetchone()
-        return row is not None
-
-    def add_authorized(self, user_id: int) -> bool:
-        """True si la personne vient d'être ajoutée, False si elle l'était déjà."""
-        with self.conn:
-            cur = self.conn.execute("INSERT OR IGNORE INTO authorized_users (user_id) VALUES (?)", (user_id,))
-        return cur.rowcount == 1
-
-    def remove_authorized(self, user_id: int) -> bool:
-        with self.conn:
-            cur = self.conn.execute("DELETE FROM authorized_users WHERE user_id = ?", (user_id,))
-        return cur.rowcount == 1
-
-    def list_authorized(self) -> list[int]:
-        return [r["user_id"] for r in self.conn.execute("SELECT user_id FROM authorized_users ORDER BY rowid")]
-
+    # « guild_admins » : la personne qui a invité le bot (mêmes droits que toi, /add compris).
+    # « guild_helpers » : les personnes ajoutées avec /add (commandes d'administration, sans /add).
+    # Tout est propre à chaque serveur : seul OWNER_ID a accès partout.
     def add_guild_admin(self, guild_id: int, user_id: int) -> bool:
-        """Accès aux commandes sur CE serveur uniquement (personne qui a ajouté le bot)."""
         with self.conn:
             cur = self.conn.execute(
                 "INSERT OR IGNORE INTO guild_admins (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id)
@@ -570,11 +559,84 @@ class Database:
         row = self.conn.execute("SELECT 1 FROM guild_admins WHERE guild_id = ?", (guild_id,)).fetchone()
         return row is not None
 
+    def list_guild_admins(self, guild_id: int) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT user_id FROM guild_admins WHERE guild_id = ? ORDER BY rowid", (guild_id,)
+        )
+        return [r["user_id"] for r in rows]
+
+    def add_helper(self, guild_id: int, user_id: int) -> bool:
+        """True si la personne vient d'être ajoutée, False si elle l'était déjà."""
+        with self.conn:
+            cur = self.conn.execute(
+                "INSERT OR IGNORE INTO guild_helpers (guild_id, user_id) VALUES (?, ?)", (guild_id, user_id)
+            )
+        return cur.rowcount == 1
+
+    def remove_helper(self, guild_id: int, user_id: int) -> bool:
+        with self.conn:
+            cur = self.conn.execute(
+                "DELETE FROM guild_helpers WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+            )
+        return cur.rowcount == 1
+
+    def is_helper(self, guild_id: int, user_id: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM guild_helpers WHERE guild_id = ? AND user_id = ?", (guild_id, user_id)
+        ).fetchone()
+        return row is not None
+
+    def list_helpers(self, guild_id: int) -> list[int]:
+        rows = self.conn.execute(
+            "SELECT user_id FROM guild_helpers WHERE guild_id = ? ORDER BY rowid", (guild_id,)
+        )
+        return [r["user_id"] for r in rows]
+
     def has_access(self, user_id: int, guild_id: int | None) -> bool:
-        """Propriétaire, personnes ajoutées avec /add, ou personne qui a ajouté le bot sur ce serveur."""
-        if user_id == OWNER_ID or self.is_authorized(user_id):
+        """Commandes d'administration : toi, la personne qui a invité le bot, ou une personne ajoutée
+        avec /add, uniquement sur le serveur concerné."""
+        if user_id == OWNER_ID:
+            return True
+        if guild_id is None:
+            return False
+        return self.is_guild_admin(guild_id, user_id) or self.is_helper(guild_id, user_id)
+
+    def can_manage_access(self, user_id: int, guild_id: int | None) -> bool:
+        """/add : toi et la personne qui a invité le bot (mêmes droits)."""
+        if user_id == OWNER_ID:
             return True
         return guild_id is not None and self.is_guild_admin(guild_id, user_id)
+
+    # -- suppression de questions ------------------------------------------ #
+    def pending_count(self, guild_id: int) -> int:
+        """Questions pas encore postées (stock quotidien + programmées)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM questions WHERE guild_id = ? AND used = 0", (guild_id,)
+        ).fetchone()
+        return row[0]
+
+    def delete_last_pending(self, guild_id: int) -> sqlite3.Row | None:
+        """Supprime la dernière question ajoutée parmi celles pas encore postées."""
+        row = self.conn.execute(
+            "SELECT id, question, post_at FROM questions WHERE guild_id = ? AND used = 0 "
+            "ORDER BY id DESC LIMIT 1",
+            (guild_id,),
+        ).fetchone()
+        if row:
+            with self.conn:
+                self.conn.execute("DELETE FROM question_files WHERE question_id = ?", (row["id"],))
+                self.conn.execute("DELETE FROM questions WHERE id = ?", (row["id"],))
+        return row
+
+    def delete_all_pending(self, guild_id: int) -> int:
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM question_files WHERE question_id IN "
+                "(SELECT id FROM questions WHERE guild_id = ? AND used = 0)",
+                (guild_id,),
+            )
+            cur = self.conn.execute("DELETE FROM questions WHERE guild_id = ? AND used = 0", (guild_id,))
+        return cur.rowcount
 
 
 # --------------------------------------------------------------------------- #
@@ -1115,6 +1177,26 @@ class ConfirmEndView(discord.ui.View):
         await interaction.response.edit_message(content="Annulé : l'événement continue.", view=None)
 
 
+class ConfirmDeleteAllView(discord.ui.View):
+    def __init__(self, db: Database, guild_id: int) -> None:
+        super().__init__(timeout=60)
+        self.db = db
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="Tout supprimer", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        deleted = self.db.delete_all_pending(self.guild_id)
+        await interaction.response.edit_message(
+            content=f"🗑️ **{deleted}** question(s) supprimée(s).", view=None
+        )
+
+    @discord.ui.button(label="Annuler", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Annulé : rien n'a été supprimé.", view=None)
+
+
 class ConfirmResetView(discord.ui.View):
     def __init__(self, db: Database) -> None:
         super().__init__(timeout=30)
@@ -1138,7 +1220,7 @@ class ConfirmResetView(discord.ui.View):
 # Cog principal
 # --------------------------------------------------------------------------- #
 def authorized_only():
-    """Réservé au propriétaire, aux personnes ajoutées avec /add et à celle qui a ajouté le bot sur le serveur."""
+    """Réservé à toi, à la personne qui a invité le bot et aux personnes ajoutées avec /add (sur ce serveur)."""
 
     async def predicate(interaction: discord.Interaction) -> bool:
         db = interaction.client.db  # type: ignore[attr-defined]
@@ -1147,11 +1229,12 @@ def authorized_only():
     return app_commands.check(predicate)
 
 
-def owner_only():
-    """Réservé au propriétaire uniquement."""
+def access_manager_only():
+    """Réservé à toi et à la personne qui a invité le bot (pour /add), sur ce serveur."""
 
     async def predicate(interaction: discord.Interaction) -> bool:
-        return interaction.user.id == OWNER_ID
+        db = interaction.client.db  # type: ignore[attr-defined]
+        return db.can_manage_access(interaction.user.id, interaction.guild_id)
 
     return app_commands.check(predicate)
 
@@ -1370,37 +1453,87 @@ class Quiz(commands.Cog):
         await interaction.response.send_message(embed=embed, allowed_mentions=no_ping)
 
     # ------------------------------ Accès au bot --------------------------- #
-    @app_commands.command(name="add", description="Donner (ou retirer) l'accès aux commandes du bot")
+    @app_commands.command(name="add", description="Donner (ou retirer) l'accès aux commandes du bot sur ce serveur")
     @app_commands.describe(
-        utilisateur="Personne à qui donner l'accès",
+        utilisateur="Membre de ce serveur à qui donner l'accès",
         retirer="Mets True pour retirer son accès au lieu de le donner",
     )
     @app_commands.guild_only()
-    @owner_only()
+    @access_manager_only()
     async def add(
-        self, interaction: discord.Interaction, utilisateur: discord.User, retirer: bool = False
+        self, interaction: discord.Interaction, utilisateur: discord.Member, retirer: bool = False
     ) -> None:
+        guild_id = interaction.guild_id
         if utilisateur.bot:
             msg = "⚠️ Un bot ne peut pas être autorisé."
-        elif utilisateur.id == OWNER_ID:
-            msg = "ℹ️ Tu es le propriétaire : tu as déjà tous les droits."
+        elif utilisateur.id == OWNER_ID or self.db.is_guild_admin(guild_id, utilisateur.id):
+            msg = f"ℹ️ {utilisateur.mention} a déjà tous les droits sur ce serveur."
         elif retirer:
-            if self.db.remove_authorized(utilisateur.id):
-                msg = f"🗑️ {utilisateur.mention} n'a plus accès aux commandes du bot."
+            if self.db.remove_helper(guild_id, utilisateur.id):
+                msg = f"🗑️ {utilisateur.mention} n'a plus accès aux commandes du bot sur ce serveur."
             else:
                 msg = f"ℹ️ {utilisateur.mention} n'avait pas accès."
         else:
-            if self.db.add_authorized(utilisateur.id):
-                msg = f"✅ {utilisateur.mention} peut maintenant utiliser les commandes du bot."
+            if self.db.add_helper(guild_id, utilisateur.id):
+                msg = f"✅ {utilisateur.mention} peut maintenant utiliser les commandes du bot sur ce serveur."
             else:
                 msg = f"ℹ️ {utilisateur.mention} avait déjà accès."
 
-        allowed = self.db.list_authorized()
-        listing = ", ".join(f"<@{uid}>" for uid in allowed) if allowed else "aucune"
+        admins = self.db.list_guild_admins(guild_id)
+        helpers = self.db.list_helpers(guild_id)
+        lines = [msg]
+        if admins:
+            lines.append("👑 Accès complet : " + ", ".join(f"<@{uid}>" for uid in admins))
+        lines.append(
+            "✅ Autorisés : " + (", ".join(f"<@{uid}>" for uid in helpers) if helpers else "personne")
+        )
         await interaction.response.send_message(
-            f"{msg}\n👥 Personnes autorisées : {listing}",
+            "\n".join(lines), ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
+        )
+
+    # ---------------------------- Supprimer des questions ------------------ #
+    @app_commands.command(name="supprimer", description="Supprimer la dernière question ou toutes celles en attente")
+    @app_commands.describe(choix="Que veux-tu supprimer ?")
+    @app_commands.choices(
+        choix=[
+            app_commands.Choice(name="La dernière question ajoutée", value="derniere"),
+            app_commands.Choice(name="Toutes les questions en attente", value="toutes"),
+        ]
+    )
+    @app_commands.guild_only()
+    @authorized_only()
+    async def supprimer(self, interaction: discord.Interaction, choix: app_commands.Choice[str]) -> None:
+        guild_id = interaction.guild_id
+        if choix.value == "derniere":
+            row = self.db.delete_last_pending(guild_id)
+            if row is None:
+                await interaction.response.send_message("📭 Aucune question en attente.", ephemeral=True)
+                return
+            question = row["question"].replace("\n", " ")
+            if len(question) > 150:
+                question = question[:149] + "…"
+            when = (
+                f" (prévue le {discord.utils.format_dt(datetime.fromisoformat(row['post_at']), 'f')})"
+                if row["post_at"]
+                else " (stock quotidien)"
+            )
+            await interaction.response.send_message(
+                f"🗑️ Dernière question supprimée{when} :\n> {question}\n"
+                f"Il reste **{self.db.pending_count(guild_id)}** question(s) en attente.",
+                ephemeral=True,
+            )
+            return
+
+        count = self.db.pending_count(guild_id)
+        if count == 0:
+            await interaction.response.send_message("📭 Aucune question en attente.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            f"⚠️ Supprimer **toutes** les questions en attente (**{count}**) ? "
+            "Cela concerne le stock quotidien et les questions programmées, pas la question déjà postée. "
+            "Cette action est irréversible.",
+            view=ConfirmDeleteAllView(self.db, guild_id),
             ephemeral=True,
-            allowed_mentions=discord.AllowedMentions.none(),
         )
 
     # ----------------------------- Fin de l'événement --------------------- #
@@ -1681,9 +1814,13 @@ class Quiz(commands.Cog):
         self.db.update_schedule_after_post(guild_id, today, days_left, enabled=days_left > 0)
 
     # ------------------- Accès pour la personne qui ajoute le bot ----------- #
-    async def register_inviter(self, guild: discord.Guild) -> None:
-        """Donne accès aux commandes (sur ce serveur) à la personne qui a ajouté le bot,
-        sinon au propriétaire du serveur."""
+    async def register_inviter(self, guild: discord.Guild, wait: bool = False) -> None:
+        """Donne accès aux commandes (sur ce serveur) à la personne qui a ajouté le bot.
+
+        1) les logs du serveur (si le bot a la permission « Voir les logs du serveur »)
+        2) l'événement d'intégration envoyé par Discord (voir on_integration_create)
+        3) à défaut, le propriétaire du serveur
+        """
         inviter_id = None
         try:
             async for entry in guild.audit_logs(limit=25, action=discord.AuditLogAction.bot_add):
@@ -1691,15 +1828,41 @@ class Quiz(commands.Cog):
                     inviter_id = entry.user_id
                     break
         except (discord.Forbidden, discord.HTTPException):
-            log.info("Logs du serveur illisibles sur %s (permission manquante) : accès donné au propriétaire.", guild.id)
-        if inviter_id is None:
-            inviter_id = guild.owner_id
-        if inviter_id and self.db.add_guild_admin(guild.id, inviter_id):
-            log.info("Accès aux commandes donné à %s sur le serveur %s", inviter_id, guild.id)
+            pass  # le bot n'a pas la permission de lire les logs
+        if inviter_id is not None:
+            if self.db.add_guild_admin(guild.id, inviter_id):
+                log.info("Accès aux commandes donné à %s sur le serveur %s (logs)", inviter_id, guild.id)
+            return
+
+        if wait:
+            await asyncio.sleep(10)  # laisse à Discord le temps d'envoyer l'événement d'intégration
+        if self.db.has_guild_admin(guild.id):
+            return
+        if guild.owner_id and self.db.add_guild_admin(guild.id, guild.owner_id):
+            log.info("Personne qui a invité le bot introuvable sur %s : accès donné au propriétaire.", guild.id)
+
+    @commands.Cog.listener()
+    async def on_integration_create(self, integration: discord.Integration) -> None:
+        """Quand le bot est ajouté, Discord crée une « intégration » qui indique qui l'a ajouté."""
+        try:
+            application = getattr(integration, "application", None)
+            bot_user = getattr(application, "user", None)
+            if bot_user is None or bot_user.id != self.bot.user.id:  # type: ignore[union-attr]
+                return  # autre intégration (Twitch, YouTube, autre bot...)
+            user = integration.user
+            if user is not None and not user.bot:
+                if self.db.add_guild_admin(integration.guild.id, user.id):
+                    log.info(
+                        "Accès aux commandes donné à %s sur le serveur %s (intégration)",
+                        user.id,
+                        integration.guild.id,
+                    )
+        except Exception:
+            log.exception("Lecture de l'intégration impossible")
 
     @commands.Cog.listener()
     async def on_guild_join(self, guild: discord.Guild) -> None:
-        await self.register_inviter(guild)
+        await self.register_inviter(guild, wait=True)
 
     @commands.Cog.listener()
     async def on_ready(self) -> None:
