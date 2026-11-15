@@ -638,6 +638,20 @@ class Database:
             cur = self.conn.execute("DELETE FROM questions WHERE guild_id = ? AND used = 0", (guild_id,))
         return cur.rowcount
 
+    def pending_questions(self, guild_id: int) -> list[sqlite3.Row]:
+        """Questions pas encore postées : d'abord le stock quotidien, puis les programmées par date."""
+        return self.conn.execute(
+            "SELECT q.*, (SELECT COUNT(*) FROM question_files f WHERE f.question_id = q.id) AS nfiles "
+            "FROM questions q WHERE q.guild_id = ? AND q.used = 0 "
+            "ORDER BY q.post_at IS NOT NULL, q.post_at, q.id",
+            (guild_id,),
+        ).fetchall()
+
+    def get_pending_question(self, guild_id: int, question_id: int) -> sqlite3.Row | None:
+        return self.conn.execute(
+            "SELECT * FROM questions WHERE id = ? AND guild_id = ? AND used = 0", (question_id, guild_id)
+        ).fetchone()
+
 
 # --------------------------------------------------------------------------- #
 # Question active (cache mémoire pour ne pas interroger la base à chaque message)
@@ -1177,6 +1191,158 @@ class ConfirmEndView(discord.ui.View):
         await interaction.response.edit_message(content="Annulé : l'événement continue.", view=None)
 
 
+class NextQuizView(discord.ui.View):
+    """/nextquiz : toutes les questions en attente (stock + programmées) ; on en choisit une et on la poste."""
+
+    PAGE_SIZE = 25  # limite d'un menu déroulant Discord
+
+    def __init__(self, cog: "Quiz", interaction: discord.Interaction, rows: list[sqlite3.Row]) -> None:
+        super().__init__(timeout=300)
+        self.cog = cog
+        self.interaction = interaction
+        self.rows = rows
+        self.page = 0
+        self.selected_id: int | None = None
+        self.select_item: discord.ui.Select | None = None
+        self._render()
+
+    @property
+    def pages(self) -> int:
+        return max(1, -(-len(self.rows) // self.PAGE_SIZE))
+
+    def _selected_row(self) -> sqlite3.Row | None:
+        return next((r for r in self.rows if r["id"] == self.selected_id), None)
+
+    def _option(self, row: sqlite3.Row) -> discord.SelectOption:
+        question = row["question"].replace("\n", " ")
+        label = ("🕒 " if row["post_at"] else "📦 ") + question
+        if len(label) > 100:
+            label = label[:99] + "…"
+        if row["post_at"]:
+            when = datetime.fromisoformat(row["post_at"]).astimezone(TZ).strftime("%d/%m/%Y à %H:%M")
+            description = f"Programmée le {when}"
+        else:
+            description = "Stock quotidien"
+        if row["nfiles"]:
+            description += f" · 📎 {row['nfiles']}"
+        return discord.SelectOption(
+            label=label,
+            description=description[:100],
+            value=str(row["id"]),
+            default=row["id"] == self.selected_id,
+        )
+
+    def _render(self) -> None:
+        """Reconstruit le menu de la page courante et l'état des boutons."""
+        if self.select_item is not None:
+            self.remove_item(self.select_item)
+        start = self.page * self.PAGE_SIZE
+        self.select_item = discord.ui.Select(
+            placeholder=f"Choisis la question à poser (page {self.page + 1}/{self.pages})",
+            options=[self._option(r) for r in self.rows[start : start + self.PAGE_SIZE]],
+            min_values=1,
+            max_values=1,
+            row=0,
+        )
+        self.select_item.callback = self._on_select
+        self.add_item(self.select_item)
+        self.prev_button.disabled = self.page == 0
+        self.next_button.disabled = self.page >= self.pages - 1
+        self.post_button.disabled = self._selected_row() is None
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="📣 Poser une question maintenant",
+            description=(
+                f"**{len(self.rows)}** question(s) en attente · page {self.page + 1}/{self.pages}\n"
+                "🕒 = programmée · 📦 = stock quotidien\n"
+                "Choisis une question dans le menu, puis clique sur **Poser maintenant**. "
+                "La question en cours, s'il y en a une, sera clôturée."
+            ),
+            color=discord.Color.blurple(),
+        )
+        row = self._selected_row()
+        if row:
+            embed.add_field(name="Question choisie", value=row["question"][:1000], inline=False)
+            embed.add_field(
+                name="Réponse(s)", value=", ".join(json.loads(row["answers"]))[:1000] or "—", inline=False
+            )
+            if row["post_at"]:
+                when = discord.utils.format_dt(datetime.fromisoformat(row["post_at"]), "f")
+                embed.add_field(name="Prévue", value=when)
+            else:
+                embed.add_field(name="Prévue", value="Stock quotidien")
+            mention = row["mention_text"] or (
+                (f"<@&{row['role_id']}>" if row["role_id"] else "@everyone") if row["mention"] else None
+            )
+            embed.add_field(name="Mention", value=mention or "🔕 Aucune")
+            embed.add_field(name="Fichiers", value=str(row["nfiles"] or 0))
+        return embed
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        self.selected_id = int(self.select_item.values[0])  # type: ignore[union-attr]
+        self._render()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary, row=1)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page = max(0, self.page - 1)
+        self._render()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.page = min(self.pages - 1, self.page + 1)
+        self._render()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Poser maintenant", emoji="📣", style=discord.ButtonStyle.success, row=1, disabled=True)
+    async def post_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        row = self.cog.db.get_pending_question(interaction.guild_id, self.selected_id or 0)
+        if row is None:
+            await interaction.response.send_message(
+                "⚠️ Cette question n'est plus en attente : relance `/nextquiz`.", ephemeral=True
+            )
+            return
+
+        # Salon prévu pour cette question, sinon celui du planning, sinon celui-ci.
+        guild = interaction.guild
+        channel = guild.get_channel(row["channel_id"]) if row["channel_id"] else None
+        if not isinstance(channel, discord.abc.Messageable):
+            cfg = self.cog.db.get_schedule(interaction.guild_id)
+            channel = guild.get_channel(cfg["channel_id"]) if cfg else None
+        if not isinstance(channel, discord.abc.Messageable):
+            channel = interaction.channel
+
+        await interaction.response.defer()
+        if await self.cog.post_question(interaction.guild_id, channel, row):
+            self.stop()
+            await interaction.edit_original_response(
+                content=f"✅ Question posée dans {getattr(channel, 'mention', 'le salon')}.",
+                embed=None,
+                view=None,
+            )
+        else:
+            await interaction.edit_original_response(
+                content="❌ Impossible d'envoyer la question (permissions ?).",
+                embed=self.build_embed(),
+                view=self,
+            )
+
+    @discord.ui.button(label="Fermer", style=discord.ButtonStyle.secondary, row=1)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Fermé.", embed=None, view=None)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        try:
+            await self.interaction.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
+
 class ConfirmDeleteAllView(discord.ui.View):
     def __init__(self, db: Database, guild_id: int) -> None:
         super().__init__(timeout=60)
@@ -1402,25 +1568,20 @@ class Quiz(commands.Cog):
         self.db.disable_schedule(interaction.guild_id)
         await interaction.response.send_message("⏸️ Planification arrêtée.", ephemeral=True)
 
-    @app_commands.command(name="nextquiz", description="Poser tout de suite la prochaine question du stock")
+    @app_commands.command(
+        name="nextquiz", description="Choisir une question en attente (stock ou programmée) et la poser tout de suite"
+    )
     @app_commands.guild_only()
     @authorized_only()
     async def nextquiz(self, interaction: discord.Interaction) -> None:
-        cfg = self.db.get_schedule(interaction.guild_id)
-        channel = interaction.guild.get_channel(cfg["channel_id"]) if cfg else interaction.channel
-        if not isinstance(channel, discord.abc.Messageable):
-            await interaction.response.send_message("⚠️ Salon du quiz introuvable.", ephemeral=True)
+        rows = self.db.pending_questions(interaction.guild_id)
+        if not rows:
+            await interaction.response.send_message(
+                "📭 Aucune question en attente. Ajoutes-en avec `/addquiz` ou `/importquiz`.", ephemeral=True
+            )
             return
-        row = self.db.next_question(interaction.guild_id)
-        if row is None:
-            await interaction.response.send_message("📭 Le stock de questions est vide.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        ok = await self.post_question(interaction.guild_id, channel, row)
-        await interaction.followup.send(
-            "✅ Question posée." if ok else "❌ Impossible d'envoyer la question (permissions ?).",
-            ephemeral=True,
-        )
+        view = NextQuizView(self, interaction, rows)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
     # ------------------------- Rappel de la question ---------------------- #
     @app_commands.command(name="question", description="Rappeler la question en cours")
