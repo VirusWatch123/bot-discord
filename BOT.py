@@ -3,7 +3,7 @@ Bot Discord de quiz : questions, scores, planification quotidienne (SQLite).
 
 Dépendance : pip install "discord.py>=2.3"
 Configuration : crée un fichier .env à côté du script avec la ligne DISCORD_TOKEN=ton_token
-(le token n'est jamais écrit dans ce fichier). Le salon de jeu se choisit avec /schedule set.
+(le token n'est jamais écrit dans ce fichier). Le salon de jeu se choisit avec l'option « salon » de /addquiz.
 À activer dans le portail développeur : « Message Content Intent ».
 """
 
@@ -229,6 +229,19 @@ def safe_filename(name: str, used: set[str]) -> str:
 
 def is_image(filename: str) -> bool:
     return filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))
+
+
+def missing_permissions(channel, member, needs_files: bool = False) -> list[str]:
+    """Permissions (en français) qui manquent au bot pour poster une question dans ce salon."""
+    perms = channel.permissions_for(member)
+    wanted = [
+        ("view_channel", "Voir le salon"),
+        ("send_messages", "Envoyer des messages"),
+        ("embed_links", "Intégrer des liens"),
+    ]
+    if needs_files:
+        wanted.append(("attach_files", "Joindre des fichiers"))
+    return [label for attr, label in wanted if not getattr(perms, attr, False)]
 
 
 def allowed_mentions_for(text: str | None) -> discord.AllowedMentions:
@@ -733,7 +746,7 @@ class DraftModal(SafeModal, title="Nouvelle question"):
     )
     hour = discord.ui.TextInput(
         label="Heure (facultatif)",
-        placeholder="18:30 (jour et heure vides = stock quotidien)",
+        placeholder="18:30 (jour et heure vides = en stock)",
         required=False,
         max_length=5,
     )
@@ -878,7 +891,7 @@ class QuestionPanel(discord.ui.View):
             description=(
                 "Clique sur **➕ Ajouter une question**, puis sur **Valider** quand tu as fini.\n"
                 "Avec une heure (et un jour si tu veux), la question est postée à ce moment précis ; "
-                "sans heure, elle rejoint le stock quotidien (`/schedule set`).\n"
+                "sans heure, elle reste en stock : tu la postes quand tu veux avec `/nextquiz`.\n"
                 "**🔔 Mention** : choisis qui est mentionné. "
                 "**📎** : joins une image ou un fichier à la dernière question."
             ),
@@ -896,7 +909,7 @@ class QuestionPanel(discord.ui.View):
                 when = (
                     f"🕒 {discord.utils.format_dt(draft.post_at, 'f')}"
                     if draft.post_at
-                    else "📦 stock quotidien"
+                    else "📦 en stock"
                 )
                 extra = f" · 📎 {len(draft.files)}" if draft.files else ""
                 lines.append(f"**{i}.** {question} → *{draft.answers[0][:40]}* · {when}{extra}")
@@ -1055,10 +1068,10 @@ class QuestionPanel(discord.ui.View):
         if timed:
             parts.append(f"{timed} à heure précise")
         if stock:
-            parts.append(f"{stock} dans le stock quotidien")
+            parts.append(f"{stock} en stock")
         msg = f"✅ **{len(self.drafts)}** question(s) enregistrée(s) ({', '.join(parts)})."
-        if stock and self.db.get_schedule(interaction.guild_id) is None:
-            msg += "\n💡 Pour envoyer le stock chaque jour, configure `/schedule set`."
+        if stock:
+            msg += "\n💡 Les questions en stock se postent avec `/nextquiz`."
         self.stop()
         await interaction.response.edit_message(content=msg, embed=None, view=None)
 
@@ -1222,7 +1235,7 @@ class NextQuizView(discord.ui.View):
             when = datetime.fromisoformat(row["post_at"]).astimezone(TZ).strftime("%d/%m/%Y à %H:%M")
             description = f"Programmée le {when}"
         else:
-            description = "Stock quotidien"
+            description = "En stock"
         if row["nfiles"]:
             description += f" · 📎 {row['nfiles']}"
         return discord.SelectOption(
@@ -1255,7 +1268,7 @@ class NextQuizView(discord.ui.View):
             title="📣 Poser une question maintenant",
             description=(
                 f"**{len(self.rows)}** question(s) en attente · page {self.page + 1}/{self.pages}\n"
-                "🕒 = programmée · 📦 = stock quotidien\n"
+                "🕒 = programmée · 📦 = en stock\n"
                 "Choisis une question dans le menu, puis clique sur **Poser maintenant**. "
                 "La question en cours, s'il y en a une, sera clôturée."
             ),
@@ -1271,7 +1284,7 @@ class NextQuizView(discord.ui.View):
                 when = discord.utils.format_dt(datetime.fromisoformat(row["post_at"]), "f")
                 embed.add_field(name="Prévue", value=when)
             else:
-                embed.add_field(name="Prévue", value="Stock quotidien")
+                embed.add_field(name="Prévue", value="En stock")
             mention = row["mention_text"] or (
                 (f"<@&{row['role_id']}>" if row["role_id"] else "@everyone") if row["mention"] else None
             )
@@ -1305,26 +1318,59 @@ class NextQuizView(discord.ui.View):
             )
             return
 
-        # Salon prévu pour cette question, sinon celui du planning, sinon celui-ci.
+        # Salons possibles, dans l'ordre : celui prévu pour la question, celui du planning, celui-ci.
         guild = interaction.guild
-        channel = guild.get_channel(row["channel_id"]) if row["channel_id"] else None
-        if not isinstance(channel, discord.abc.Messageable):
-            cfg = self.cog.db.get_schedule(interaction.guild_id)
-            channel = guild.get_channel(cfg["channel_id"]) if cfg else None
-        if not isinstance(channel, discord.abc.Messageable):
-            channel = interaction.channel
+        cfg = self.cog.db.get_schedule(interaction.guild_id)
+        raw = [
+            guild.get_channel(row["channel_id"]) if row["channel_id"] else None,
+            guild.get_channel(cfg["channel_id"]) if cfg else None,
+            interaction.channel,
+        ]
+        candidates: list = []
+        for channel in raw:
+            if isinstance(channel, discord.abc.Messageable) and all(
+                getattr(channel, "id", None) != getattr(c, "id", None) for c in candidates
+            ):
+                candidates.append(channel)
+
+        # On prend le premier salon où le bot a les permissions nécessaires.
+        selected = self._selected_row()
+        needs_files = bool(selected["nfiles"]) if selected else False
+        target = None
+        for channel in candidates:
+            if not missing_permissions(channel, guild.me, needs_files):
+                target = channel
+                break
+        if target is None:
+            if not candidates:
+                reason = "⚠️ Je ne trouve aucun salon où poster la question."
+            else:
+                first = candidates[0]
+                missing = ", ".join(f"**{name}**" for name in missing_permissions(first, guild.me, needs_files))
+                reason = (
+                    f"❌ Je ne peux pas poster dans {getattr(first, 'mention', 'ce salon')} : "
+                    f"il me manque {missing}.\n"
+                    "Un administrateur de ce serveur doit me donner ces permissions "
+                    "(sur mon rôle ou dans les réglages du salon), puis tu pourras réessayer."
+                )
+            await interaction.response.send_message(reason, ephemeral=True)
+            return
 
         await interaction.response.defer()
-        if await self.cog.post_question(interaction.guild_id, channel, row):
+        if await self.cog.post_question(interaction.guild_id, target, row):
             self.stop()
+            note = ""
+            if row["channel_id"] and getattr(target, "id", None) != row["channel_id"]:
+                note = "\nℹ️ Le salon prévu pour cette question n'était pas utilisable : elle a été posée ici à la place."
             await interaction.edit_original_response(
-                content=f"✅ Question posée dans {getattr(channel, 'mention', 'le salon')}.",
+                content=f"✅ Question posée dans {getattr(target, 'mention', 'le salon')}.{note}",
                 embed=None,
                 view=None,
             )
         else:
+            detail = f"\nDétail Discord : `{self.cog.last_send_error}`" if self.cog.last_send_error else ""
             await interaction.edit_original_response(
-                content="❌ Impossible d'envoyer la question (permissions ?).",
+                content=f"❌ Discord a refusé l'envoi dans {getattr(target, 'mention', 'ce salon')}.{detail}",
                 embed=self.build_embed(),
                 view=self,
             )
@@ -1406,16 +1452,11 @@ def access_manager_only():
 
 
 class Quiz(commands.Cog):
-    schedule_group = app_commands.Group(
-        name="schedule",
-        description="Planification de la question quotidienne",
-        guild_only=True,
-    )
-
     def __init__(self, bot: commands.Bot, db: Database) -> None:
         self.bot = bot
         self.db = db
         self.active: dict[int, ActiveQuestion] = {}  # channel_id -> question en cours
+        self.last_send_error: str | None = None      # raison du dernier refus d'envoi par Discord
 
     async def cog_load(self) -> None:
         for row in self.db.active_questions():
@@ -1430,7 +1471,7 @@ class Quiz(commands.Cog):
         name="addquiz", description="Poser des questions (jour, heure, mention et fichiers au choix)"
     )
     @app_commands.describe(
-        salon="Salon où poser les questions (par défaut : celui du planning, sinon ce salon)",
+        salon="Salon où poser les questions (par défaut : le salon où tu tapes la commande)",
     )
     @app_commands.guild_only()
     @authorized_only()
@@ -1482,91 +1523,6 @@ class Quiz(commands.Cog):
         await interaction.followup.send(
             import_questions(self.db, interaction.guild_id, text), ephemeral=True
         )
-
-    # --------------------------- Planification ---------------------------- #
-    @schedule_group.command(name="set", description="Programmer la question quotidienne")
-    @app_commands.describe(
-        salon="Salon où poser les questions",
-        heure="Heure de diffusion (0-23)",
-        jours="Nombre de jours : une question par jour, donc autant de questions",
-        minute="Minute de diffusion (0-59, 0 par défaut)",
-    )
-    @authorized_only()
-    async def schedule_set(
-        self,
-        interaction: discord.Interaction,
-        salon: discord.TextChannel,
-        heure: app_commands.Range[int, 0, 23],
-        jours: app_commands.Range[int, 1, 365],
-        minute: app_commands.Range[int, 0, 59] = 0,
-    ) -> None:
-        perms = salon.permissions_for(interaction.guild.me)
-        if not (perms.view_channel and perms.send_messages and perms.embed_links):
-            await interaction.response.send_message(
-                f"⛔ Je ne peux pas écrire (avec des embeds) dans {salon.mention}. "
-                "Vérifie mes permissions sur ce salon.",
-                ephemeral=True,
-            )
-            return
-
-        now = datetime.now(TZ)
-        # Si l'heure du jour est déjà passée, la première question sera posée demain.
-        last_posted = now.date().isoformat() if (now.hour, now.minute) >= (heure, minute) else None
-        self.db.save_schedule(interaction.guild_id, salon.id, heure, minute, jours, last_posted)
-
-        first = next_run(heure, minute, last_posted, now)
-        stock = self.db.stock(interaction.guild_id)
-        msg = (
-            f"✅ Une question par jour à **{heure:02d}:{minute:02d}** dans {salon.mention}, "
-            f"pendant **{jours}** jour(s).\n"
-            f"📅 Première question : {discord.utils.format_dt(first, 'F')}"
-        )
-        if stock < jours:
-            msg += (
-                f"\n⚠️ Stock actuel : **{stock}** question(s) pour **{jours}** jour(s). "
-                "Ajoutes-en avec `/addquiz` ou `/importquiz`."
-            )
-        await interaction.response.send_message(msg, ephemeral=True)
-
-    @schedule_group.command(name="status", description="Voir la planification et le stock")
-    @authorized_only()
-    async def schedule_status(self, interaction: discord.Interaction) -> None:
-        cfg = self.db.get_schedule(interaction.guild_id)
-        embed = discord.Embed(title="📅 Planification du quiz", color=discord.Color.blurple())
-        if cfg is None:
-            embed.description = "Aucune planification. Utilise `/schedule set`."
-        else:
-            channel = interaction.guild.get_channel(cfg["channel_id"])
-            active = bool(cfg["enabled"]) and cfg["days_left"] > 0
-            embed.add_field(name="Salon", value=channel.mention if channel else "introuvable")
-            embed.add_field(name="Heure", value=f"{cfg['hour']:02d}:{cfg['minute']:02d}")
-            embed.add_field(name="Jours restants", value=str(cfg["days_left"]))
-            embed.add_field(name="État", value="✅ Active" if active else "⏸️ Arrêtée")
-            if active:
-                run = next_run(cfg["hour"], cfg["minute"], cfg["last_posted"], datetime.now(TZ))
-                embed.add_field(name="Prochaine question", value=discord.utils.format_dt(run, "F"))
-        embed.add_field(
-            name="Stock quotidien",
-            value=f"{self.db.stock(interaction.guild_id)} question(s) en réserve",
-            inline=False,
-        )
-        pending = self.db.pending_timed(interaction.guild_id)
-        if pending:
-            lines = []
-            for row in pending[:5]:
-                when = discord.utils.format_dt(datetime.fromisoformat(row["post_at"]), "f")
-                question = row["question"].replace("\n", " ")[:50]
-                lines.append(f"{when} — {question}")
-            if len(pending) > 5:
-                lines.append(f"… et {len(pending) - 5} autre(s)")
-            embed.add_field(name="Questions à heure précise", value="\n".join(lines), inline=False)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @schedule_group.command(name="stop", description="Arrêter la planification")
-    @authorized_only()
-    async def schedule_stop(self, interaction: discord.Interaction) -> None:
-        self.db.disable_schedule(interaction.guild_id)
-        await interaction.response.send_message("⏸️ Planification arrêtée.", ephemeral=True)
 
     @app_commands.command(
         name="nextquiz", description="Choisir une question en attente (stock ou programmée) et la poser tout de suite"
@@ -1676,7 +1632,7 @@ class Quiz(commands.Cog):
             when = (
                 f" (prévue le {discord.utils.format_dt(datetime.fromisoformat(row['post_at']), 'f')})"
                 if row["post_at"]
-                else " (stock quotidien)"
+                else " (en stock)"
             )
             await interaction.response.send_message(
                 f"🗑️ Dernière question supprimée{when} :\n> {question}\n"
@@ -1691,7 +1647,7 @@ class Quiz(commands.Cog):
             return
         await interaction.response.send_message(
             f"⚠️ Supprimer **toutes** les questions en attente (**{count}**) ? "
-            "Cela concerne le stock quotidien et les questions programmées, pas la question déjà postée. "
+            "Cela concerne les questions en stock et les questions programmées, pas la question déjà postée. "
             "Cette action est irréversible.",
             view=ConfirmDeleteAllView(self.db, guild_id),
             ephemeral=True,
@@ -1724,8 +1680,8 @@ class Quiz(commands.Cog):
             f"🏁 **Terminer l'événement ?**\n"
             f"🏆 {label} : {mentions} avec **{points}** point{'s' if points > 1 else ''}\n\n"
             f"L'annonce sera postée dans {getattr(channel, 'mention', 'ce salon')}. "
-            "Cela arrête aussi le planning, clôture la question en cours et annule "
-            "les questions programmées à heure précise.",
+            "Cela clôture aussi la question en cours et annule les questions "
+            "programmées à heure précise (les questions en stock restent).",
             view=ConfirmEndView(self, interaction.guild_id, channel),
             ephemeral=True,
             allowed_mentions=discord.AllowedMentions.none(),
@@ -1850,6 +1806,7 @@ class Quiz(commands.Cog):
     async def post_question(
         self, guild_id: int, channel: discord.abc.Messageable, row: sqlite3.Row
     ) -> bool:
+        self.last_send_error = None
         # L'ancienne question est désactivée dès qu'on en poste une nouvelle.
         previous = self.db.expire_active(guild_id)
         if previous:
@@ -1894,7 +1851,8 @@ class Quiz(commands.Cog):
                     content=content, embed=embed, files=attempt, allowed_mentions=allowed
                 )
                 break
-            except discord.HTTPException:
+            except discord.HTTPException as err:
+                self.last_send_error = f"{err.status} (code {err.code}) {err.text}"
                 log.exception("Impossible d'envoyer la question dans le salon %s", channel.id)  # type: ignore[attr-defined]
                 if not attempt:
                     break
@@ -1964,7 +1922,7 @@ class Quiz(commands.Cog):
             try:
                 await channel.send(
                     "📭 Le stock de questions est vide : la planification est arrêtée. "
-                    "Un administrateur peut ajouter des questions puis relancer `/schedule set`."
+                    "Un administrateur peut ajouter des questions avec `/addquiz`."
                 )
             except discord.HTTPException:
                 pass
