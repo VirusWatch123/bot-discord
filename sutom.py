@@ -19,13 +19,42 @@ CREATE TABLE IF NOT EXISTS sessions(tok TEXT PRIMARY KEY, guild INT, user INT, c
 """)
 
 def norm(s):
-    s = unicodedata.normalize("NFD", s).upper()
+    s = unicodedata.normalize("NFD", s.replace("œ", "oe").replace("Œ", "OE").replace("æ", "ae")).upper()
     return "".join(c for c in s if "A" <= c <= "Z")
 
 # Dictionnaire facultatif : un mot par ligne dans mots.txt (sans ça, tout mot de la bonne longueur est accepté)
+import re
 WORDS = set()
-if os.path.exists("mots.txt"):
-    WORDS = {norm(l) for l in open("mots.txt", encoding="utf-8") if l.strip()}
+LETTERS = re.compile(r"[a-zàâäçéèêëîïôöùûüÿœæ]+")
+CACHE = "mots_fr.txt"
+SOURCES = [  # liste de ~336 000 mots français (formes conjuguées et accordées comprises)
+    "https://cdn.jsdelivr.net/npm/an-array-of-french-words@2/index.json",
+    "https://raw.githubusercontent.com/words/an-array-of-french-words/main/index.json",
+    "https://raw.githubusercontent.com/words/an-array-of-french-words/master/index.json",
+]
+for f in ("mots.txt", CACHE):  # un mot par ligne, tu peux aussi poser ton propre mots.txt
+    if os.path.exists(f):
+        WORDS |= {norm(l) for l in open(f, encoding="utf-8") if l.strip()}
+
+async def load_words():
+    """Télécharge le dictionnaire au démarrage (une seule fois, puis cache). Sans lui, tout mot est accepté."""
+    if WORDS: return
+    import aiohttp
+    for url in SOURCES:
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=120)) as ses:
+                async with ses.get(url) as r:
+                    if r.status != 200: continue
+                    data = json.loads(await r.text())
+            ws = {norm(w) for w in data if isinstance(w, str) and LETTERS.fullmatch(w) and 3 <= len(w) <= 14}
+            if len(ws) < 1000: continue
+            WORDS.update(ws)
+            open(CACHE, "w", encoding="utf-8").write("\n".join(sorted(ws)))
+            print(f"[sutom] dictionnaire chargé : {len(ws)} mots")
+            return
+        except Exception as e:
+            print("[sutom] dictionnaire indisponible via", url, e)
+    print("[sutom] AUCUN dictionnaire chargé : tous les mots sont acceptés")
 
 def today():
     return dt.datetime.now(TZ).date().isoformat()
@@ -133,7 +162,7 @@ async def guess(r):
     if done: return bad("Partie terminée")
     if len(g) != len(w): return bad(f"Le mot doit faire {len(w)} lettres")
     if g[0] != w[0]: return bad(f"Le mot doit commencer par {w[0]}")
-    if WORDS and g not in WORDS: return bad("Ce mot n'est pas dans le dictionnaire")
+    if WORDS and g not in WORDS and g != w: return bad("Ce mot n'est pas dans le dictionnaire")
     gs.append(g); won = g == w; done = won or len(gs) >= MAX
     db.execute("INSERT OR REPLACE INTO games VALUES(?,?,?,?,?,?)", (s[0], s[1], day, json.dumps(gs), int(done), int(won))); db.commit()
     if done: asyncio.create_task(announce(s, gs, w, won))
@@ -151,26 +180,36 @@ PAGE = r'''<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name
 <title>SUTOM</title><link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;700;800&display=swap" rel="stylesheet">
 <style>
 :root{--c:#e5162d;--p:#ffc01e;--t:#1a4bb0}*{box-sizing:border-box;margin:0}
-body{min-height:100vh;background:radial-gradient(120% 80% at 50% -10%,#1a4bb0,#0a2463 45%,#06143a);color:#fff;font-family:'Bricolage Grotesque',system-ui,sans-serif;overflow-x:hidden}
+body{min-height:100vh;background:#050d2b;color:#fff;font-family:'Bricolage Grotesque',system-ui,sans-serif;overflow-x:hidden}
+body::before{content:'';position:fixed;inset:-20%;background:radial-gradient(40% 35% at 20% 15%,rgba(229,22,45,.28),transparent 70%),radial-gradient(45% 40% at 80% 25%,rgba(38,99,235,.55),transparent 70%),radial-gradient(50% 45% at 50% 100%,rgba(255,192,30,.16),transparent 70%);animation:drift 22s ease-in-out infinite alternate;pointer-events:none}
+@keyframes drift{to{transform:translate3d(3%,2%,0) scale(1.08)}}
+body::after{content:'';position:fixed;inset:0;background:radial-gradient(rgba(160,190,255,.22) 1px,transparent 1.5px) 0 0/26px 26px;-webkit-mask:radial-gradient(70% 60% at 50% 40%,#000,transparent);mask:radial-gradient(70% 60% at 50% 40%,#000,transparent);pointer-events:none}
 #fx{position:fixed;inset:0;pointer-events:none}
-main{position:relative;max-width:540px;margin:0 auto;padding:20px 16px 28px;display:flex;flex-direction:column;align-items:center;gap:18px}
-header{width:100%;display:flex;justify-content:space-between;align-items:center;gap:10px}
-.brand{display:flex;gap:5px}.brand .t{--s:34px}
-.who{display:flex;align-items:center;gap:10px;font-weight:700;padding:5px 14px 5px 5px;border-radius:99px;background:rgba(255,255,255,.08);backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.14);min-width:0}
-.who img{width:30px;height:30px;border-radius:50%}.who span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-#sub{opacity:.7;font-size:14px;text-align:center}
-#grid{display:grid;gap:6px;perspective:800px}.row{display:grid;gap:6px}
-.t{width:var(--s);height:var(--s);display:grid;place-items:center;font-weight:800;font-size:calc(var(--s)*.52);background:rgba(255,255,255,.06);border:2px solid rgba(160,190,255,.25);border-radius:6px;position:relative;z-index:0;transition:border-color .15s}
-.t.f{border-color:#fff}.t.h{color:rgba(255,255,255,.35)}
-.t.c{background:var(--c);border-color:#ff6b7d;box-shadow:0 0 18px rgba(229,22,45,.45)}
-.t.p{border-color:transparent;color:#2a1c00}.t.p::before{content:'';position:absolute;inset:1px;border-radius:50%;background:var(--p);z-index:-1;box-shadow:0 0 16px rgba(255,192,30,.5)}
-.t.a{background:var(--t);border-color:#3d6fd8}
+main{position:relative;z-index:1;max-width:580px;margin:0 auto;padding:22px 14px 30px;display:flex;flex-direction:column;gap:18px}
+header{display:flex;justify-content:space-between;align-items:center;gap:10px}
+.brand{display:flex;gap:6px;filter:drop-shadow(0 6px 18px rgba(0,0,0,.4))}.brand .t{--s:42px}
+.who{display:flex;align-items:center;gap:10px;padding:6px 16px 6px 6px;border-radius:99px;background:linear-gradient(180deg,rgba(255,255,255,.12),rgba(255,255,255,.05));border:1px solid rgba(255,255,255,.16);backdrop-filter:blur(10px);min-width:0;box-shadow:0 8px 24px rgba(0,0,0,.3)}
+.who img{width:36px;height:36px;border-radius:50%;box-shadow:0 0 0 2px var(--p)}
+.who div{display:flex;flex-direction:column;min-width:0;line-height:1.15}.who span{font-weight:800;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.who small{opacity:.6;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.panel{display:flex;flex-direction:column;align-items:center;gap:18px;padding:22px 16px 20px;border-radius:30px;background:linear-gradient(160deg,rgba(255,255,255,.13),rgba(255,255,255,.04) 40%,rgba(8,20,70,.55));border:1px solid rgba(255,255,255,.16);box-shadow:0 30px 80px rgba(0,0,0,.5),inset 0 1px 0 rgba(255,255,255,.22);backdrop-filter:blur(14px)}
+.bar{display:flex;flex-direction:column;align-items:center;gap:8px}
+.pips{display:flex;gap:7px}.pip{width:26px;height:6px;border-radius:9px;background:rgba(255,255,255,.14);transition:.4s}.pip.u{background:var(--p);box-shadow:0 0 10px var(--p)}.pip.c{background:#fff}
+#sub{opacity:.75;font-size:14px;font-weight:500}
+#grid{display:grid;gap:7px;perspective:900px}.row{display:grid;gap:7px}
+.t{width:var(--s);height:var(--s);display:grid;place-items:center;font-weight:800;font-size:calc(var(--s)*.5);background:linear-gradient(180deg,rgba(255,255,255,.1),rgba(255,255,255,.03));border:1px solid rgba(160,190,255,.28);border-radius:9px;position:relative;z-index:0;box-shadow:inset 0 1px 0 rgba(255,255,255,.14),0 3px 8px rgba(0,0,0,.25);transition:border-color .15s}
+.t.f{border-color:#fff;background:rgba(255,255,255,.14)}.t.h{color:rgba(255,255,255,.3)}
+.pop{animation:pop2 .14s ease-out}@keyframes pop2{50%{transform:scale(1.14)}}
+.t.c{background:linear-gradient(180deg,#ff4a60,#c8061d);border-color:#ff8a98;box-shadow:inset 0 2px 0 rgba(255,255,255,.35),inset 0 -3px 0 rgba(0,0,0,.2),0 0 22px rgba(229,22,45,.5)}
+.t.p{color:#2a1c00;border-color:transparent}
+.t.p::before{content:'';position:absolute;inset:0;border-radius:50%;background:radial-gradient(circle at 35% 28%,#ffe58a,var(--p) 55%,#e39a00);z-index:-1;box-shadow:0 0 20px rgba(255,192,30,.6),inset 0 -3px 0 rgba(0,0,0,.15)}
+.t.a{background:linear-gradient(180deg,#2a62d0,#173f9a);border-color:#5b8cf0;box-shadow:inset 0 2px 0 rgba(255,255,255,.2),inset 0 -3px 0 rgba(0,0,0,.2)}
 .flip{animation:flip .6s ease both}@keyframes flip{50%{transform:rotateX(90deg)}}
 .shake{animation:sh .45s}@keyframes sh{20%,60%{transform:translateX(-7px)}40%,80%{transform:translateX(7px)}}
-#kb{display:flex;flex-direction:column;gap:6px;width:100%}.kr{display:flex;gap:5px;justify-content:center}
-.k{flex:1;max-width:44px;height:50px;border:0;border-radius:8px;background:rgba(255,255,255,.14);color:#fff;font-weight:700;font-size:15px;font-family:inherit;cursor:pointer;transition:transform .08s,background .25s}
-.k.w{max-width:66px;font-size:12px}.k:active{transform:scale(.92)}.k:focus-visible{outline:2px solid #fff}
-.k.c{background:var(--c)}.k.p{background:var(--p);color:#2a1c00}.k.a{background:rgba(0,0,0,.35);color:rgba(255,255,255,.4)}
+#kb{display:flex;flex-direction:column;gap:7px;width:100%}.kr{display:flex;gap:6px;justify-content:center}
+.k{flex:1;max-width:46px;height:52px;border:0;border-radius:10px;background:linear-gradient(180deg,rgba(255,255,255,.24),rgba(255,255,255,.12));color:#fff;font-weight:800;font-size:15px;font-family:inherit;cursor:pointer;box-shadow:0 3px 0 rgba(0,0,0,.35),inset 0 1px 0 rgba(255,255,255,.25);transition:transform .08s,box-shadow .08s,background .25s}
+.k.w{max-width:70px;font-size:12px}.k:hover{filter:brightness(1.15)}.k:active{transform:translateY(3px);box-shadow:none}.k:focus-visible{outline:2px solid #fff}
+.k.c{background:linear-gradient(180deg,#ff4a60,#c8061d)}.k.p{background:linear-gradient(180deg,#ffd45c,#e8a400);color:#2a1c00}.k.a{background:rgba(0,0,0,.4);color:rgba(255,255,255,.35)}
+@media(max-width:480px){.k{height:46px}.brand .t{--s:34px}.panel{padding:18px 8px}}
 #toast{position:fixed;top:22px;left:50%;transform:translate(-50%,-90px);background:#fff;color:#0a2463;padding:10px 18px;border-radius:99px;font-weight:700;transition:transform .35s cubic-bezier(.3,1.5,.5,1);z-index:9}
 #toast.on{transform:translate(-50%,0)}
 #modal{position:fixed;inset:0;display:grid;place-items:center;background:rgba(3,10,35,.7);backdrop-filter:blur(6px);z-index:8;padding:20px}#modal[hidden]{display:none}
@@ -181,8 +220,8 @@ header{width:100%;display:flex;justify-content:space-between;align-items:center;
 .err{margin-top:40px;font-size:18px;text-align:center}
 @media(prefers-reduced-motion:reduce){*{animation-duration:.01s!important}}
 </style></head><body><canvas id="fx"></canvas>
-<main id="app"><header><div class="brand" id="brand"></div><div class="who"><img id="av" alt=""><span id="nm"></span></div></header>
-<p id="sub"></p><div id="grid"></div><div id="kb"></div></main><div id="toast"></div>
+<main id="app"><header><div class="brand" id="brand"></div><div class="who"><img id="av" alt=""><div><span id="nm"></span><small id="gn"></small></div></div></header>
+<section class="panel"><div class="bar"><div class="pips"><i class="pip"></i><i class="pip"></i><i class="pip"></i><i class="pip"></i><i class="pip"></i><i class="pip"></i></div><p id="sub"></p></div><div id="grid"></div><div id="kb"></div></section></main><div id="toast"></div>
 <div id="modal" hidden><div class="card"><h2 id="mt"></h2><div class="ans" id="ma"></div><pre id="mp"></pre>
 <button class="btn" id="cp">Copier ma grille</button><button class="btn g" id="cl">Fermer</button></div></div>
 <script>
@@ -191,7 +230,7 @@ const api=async(p,o)=>{const r=await fetch('/api/'+p+'/'+tok,o);return[r.ok,awai
 // fond : lettres qui dérivent + confettis (carrés rouges, ronds jaunes)
 const cv=$('#fx'),cx=cv.getContext('2d');let W,H,L=[],P=[];
 const rs=()=>{W=cv.width=innerWidth;H=cv.height=innerHeight};rs();addEventListener('resize',rs);
-for(let i=0;i<34;i++)L.push({x:Math.random()*1600,y:Math.random()*1600,s:24+Math.random()*70,v:.08+Math.random()*.3,c:'SUTOMABCDEFGHIJKLMNOPQRSTUVWXYZ'[i]});
+for(let i=0;i<34;i++)L.push({x:Math.random()*1600,y:Math.random()*1600,s:18+Math.random()*40,v:.08+Math.random()*.3,c:'SUTOMABCDEFGHIJKLMNOPQRSTUVWXYZ'[i%31]});
 function loop(){cx.clearRect(0,0,W,H);cx.fillStyle='rgba(130,170,255,.07)';
 L.forEach(l=>{l.y-=l.v;if(l.y<-120){l.y=H+120;l.x=Math.random()*W}cx.font=`800 ${l.s}px 'Bricolage Grotesque',sans-serif`;cx.fillText(l.c,l.x%W,l.y)});
 P=P.filter(p=>p.y<H+30);P.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.vy+=.2;p.a+=p.va;cx.save();cx.translate(p.x,p.y);cx.rotate(p.a);cx.fillStyle=p.c;
@@ -199,21 +238,21 @@ if(p.r){cx.beginPath();cx.arc(0,0,p.z/2,0,7);cx.fill()}else cx.fillRect(-p.z/2,-
 if(!matchMedia('(prefers-reduced-motion:reduce)').matches)loop();
 const confetti=()=>{for(let i=0;i<150;i++)P.push({x:W/2,y:H*.55,vx:(Math.random()-.5)*15,vy:-Math.random()*17-4,a:0,va:(Math.random()-.5)*.4,z:8+Math.random()*10,c:['#e5162d','#ffc01e','#fff','#4f8dff'][i%4],r:i%3==0})};
 function toast(m){const t=$('#toast');t.textContent=m;t.classList.add('on');clearTimeout(tt);tt=setTimeout(()=>t.classList.remove('on'),2000)}
-function build(){const g=$('#grid'),n=S.length,sz=Math.min(58,(Math.min(innerWidth,540)-40)/n-6);g.innerHTML='';g.style.setProperty('--s',sz+'px');
+function build(){const g=$('#grid'),n=S.length,sz=Math.min(62,(Math.min(innerWidth,580)-84)/n-7);g.innerHTML='';g.style.setProperty('--s',sz+'px');
 for(let r=0;r<S.max;r++){const d=document.createElement('div');d.className='row';d.style.gridTemplateColumns=`repeat(${n},var(--s))`;const ts=[];
 for(let i=0;i<n;i++){const t=document.createElement('div');t.className='t';d.append(t);ts.push(t)}g.append(d);rows.push(ts)}}
 function hints(){const h=Array(S.length).fill('');h[0]=S.first;S.guesses.forEach(x=>x.r.forEach((v,i)=>{if(v==2)h[i]=x.w[i]}));return h}
 function paint(){const cur=S.guesses.length,h=hints();rows.forEach((ts,r)=>ts.forEach((t,i)=>{
 if(r<cur){t.textContent=S.guesses[r].w[i];t.className='t '+'apc'[S.guesses[r].r[i]]}
 else if(r==cur&&!S.done){const ch=typed[i];t.textContent=ch||h[i]||'·';t.className='t'+(ch?' f':' h')}
-else{t.textContent='';t.className='t'}}));$('#sub').textContent=S.done?'Partie terminée':`Essai ${Math.min(cur+1,S.max)} sur ${S.max}`}
+else{t.textContent='';t.className='t'}}));document.querySelectorAll('.pip').forEach((p,i)=>p.className='pip'+(i<cur?' u':i==cur&&!S.done?' c':''));$('#sub').textContent=S.done?'Partie terminée':`Essai ${Math.min(cur+1,S.max)} sur ${S.max}`}
 function ukeys(){const st={},rk={a:0,p:1,c:2};S.guesses.forEach(x=>[...x.w].forEach((ch,i)=>{const c='apc'[x.r[i]];if(!(ch in st)||rk[c]>rk[st[ch]])st[ch]=c}));
 document.querySelectorAll('.k').forEach(b=>{const c=st[b.dataset.k];if(c)b.className='k'+(b.classList.contains('w')?' w':'')+' '+c})}
 function keys(){['AZERTYUIOP','QSDFGHJKLM',['ENTER',...'WXCVBN','⌫']].forEach(r=>{const d=document.createElement('div');d.className='kr';
 [...r].forEach(k=>{const b=document.createElement('button');b.className='k'+(k.length>1||k=='⌫'?' w':'');b.textContent=k=='ENTER'?'Entrée':k;b.dataset.k=k;b.onclick=()=>press(k);d.append(b)});$('#kb').append(d)})}
 function press(k){if(!S||S.done||busy)return;if(k=='ENTER')return submit();
 if(k=='⌫'){if(typed.length>1)typed=typed.slice(0,-1);return paint()}
-if(/^[A-Z]$/.test(k)&&typed.length<S.length){typed+=k;paint()}}
+if(/^[A-Z]$/.test(k)&&typed.length<S.length){typed+=k;paint();rows[S.guesses.length][typed.length-1].classList.add('pop')}}
 addEventListener('keydown',e=>{if(e.ctrlKey||e.metaKey||e.altKey)return;let k=e.key=='Backspace'?'⌫':e.key=='Enter'?'ENTER':e.key.length==1?e.key.normalize('NFD').replace(/[\u0300-\u036f]/g,'').toUpperCase():'';if(k)press(k)});
 function shake(m){toast(m);const r=$('#grid').children[S.guesses.length];r.classList.add('shake');setTimeout(()=>r.classList.remove('shake'),450)}
 async function submit(){if(typed.length<S.length)return shake('Mot trop court');busy=true;
@@ -229,13 +268,14 @@ const EMJ=['🟦','🟡','🟥'];$('#cl').onclick=()=>$('#modal').hidden=true;
 (async()=>{[...'SUTOM'].forEach((c,i)=>{const t=document.createElement('div');t.className='t flip';t.textContent=c;t.style.animationDelay=i*.15+'s';
 setTimeout(()=>t.className='t flip '+(i==0?'c':i==1?'p':'a'),i*150+300);$('#brand').append(t)});
 const[ok,d]=await api('state');if(!ok){$('#app').innerHTML='<p class="err">'+d.error+'</p>';return}
-S=d;typed=S.first;$('#av').src=S.avatar;$('#nm').textContent=S.name;build();keys();paint();ukeys();if(S.done)end(false)})();
+S=d;typed=S.first;$('#av').src=S.avatar;$('#nm').textContent=S.name;$('#gn').textContent=S.gname;build();keys();paint();ukeys();if(S.done)end(false)})();
 </script></body></html>'''
 
 async def setup(client, tree=None, admin_check=None):
     """À appeler UNE seule fois, avant tree.sync(). admin_check(guild_id, user_id) -> bool est facultatif."""
-    global bot, _admin
+    global bot, _admin, _t
     bot, _admin = client, admin_check
+    _t = asyncio.create_task(load_words())
     for c in (setmot, sutom, top, add, remove):
         (tree or client.tree).add_command(c)
     app = web.Application()
