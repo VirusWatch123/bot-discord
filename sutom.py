@@ -212,6 +212,43 @@ async def addmots(i: discord.Interaction, mots: str):
     db.executemany("INSERT OR IGNORE INTO extra VALUES(?,?)", [(i.guild_id, w) for w in ws]); db.commit()
     await i.response.send_message(f"✅ {len(ws)} mot(s) ajouté(s) à la liste acceptée.", ephemeral=True)
 
+@app_commands.command(name="sutom-profil", description="Voir les statistiques SUTOM d'un joueur")
+@app_commands.describe(membre="Le joueur (toi par défaut)")
+@app_commands.guild_only()
+async def profil(i: discord.Interaction, membre: discord.Member = None):
+    m = membre or i.user
+    rows = db.execute("SELECT g.day,g.guesses,g.won,w.word FROM games g JOIN words w ON w.guild=g.guild AND w.day=g.day "
+                      "WHERE g.guild=? AND g.user=? AND g.done=1 ORDER BY g.day", (i.guild_id, m.id)).fetchall()
+    if not rows:
+        return await i.response.send_message(f"{m.display_name} n'a pas encore terminé de partie.", ephemeral=True)
+    played, dist, red, yel, blue, tries, cur, best, won_tries = len(rows), [0] * MAX, 0, 0, 0, 0, 0, 0, []
+    for day, gj, won, w in rows:
+        gs = json.loads(gj); tries += len(gs)
+        for x in gs:
+            for v in score(x, w):
+                if v == 2: red += 1
+                elif v == 1: yel += 1
+                else: blue += 1
+        if won:
+            dist[len(gs) - 1] += 1; won_tries.append(len(gs)); cur += 1; best = max(best, cur)
+        else:
+            cur = 0
+    wins = len(won_tries)
+    ranking = [u for u, _ in db.execute("SELECT user,SUM(won) w FROM games WHERE guild=? AND done=1 GROUP BY user ORDER BY w DESC", (i.guild_id,))]
+    top = max(dist) or 1
+    bars = "\n".join(f"{n}  {'█' * (max(1, round(10 * c / top)) if c else 0):<10} {c}" for n, c in enumerate(dist, 1))
+    e = discord.Embed(title=f"Profil SUTOM de {m.display_name}", color=0xE5162D)
+    e.set_thumbnail(url=m.display_avatar.url)
+    e.add_field(name="📊 Parties", value=f"**{played}** jouées\n**{wins}** gagnées ({round(100 * wins / played)} %)\n**{played - wins}** ratées")
+    e.add_field(name="🎯 Moyenne", value=(f"**{sum(won_tries) / wins:.2f}** essais\npar mot trouvé\nmeilleur : **{min(won_tries)}** essai(s)" if wins else "Aucun mot trouvé"))
+    e.add_field(name="🔥 Séries", value=f"actuelle : **{cur}**\nrecord : **{best}**\nrang : **#{ranking.index(m.id) + 1}**")
+    e.add_field(name="🟥 Bien placées", value=f"**{red}** lettres")
+    e.add_field(name="🟡 Mal placées", value=f"**{yel}** lettres")
+    e.add_field(name="🟦 Absentes", value=f"**{blue}** lettres")
+    e.add_field(name="⌨️ Mots proposés", value=f"**{tries}** au total", inline=False)
+    e.add_field(name="Répartition des victoires (essais)", value=f"```{bars}```", inline=False)
+    await i.response.send_message(embed=e)
+
 # ───────────────────────────── Serveur web ─────────────────────────────
 def sess(t):
     return db.execute("SELECT guild,user,channel,name,avatar,gname FROM sessions WHERE tok=? AND exp>?", (t, time.time())).fetchone()
@@ -358,7 +395,7 @@ async def setup(client, tree=None, admin_check=None):
     bot, _admin = client, admin_check
     _t = asyncio.create_task(load_words())
     _t2 = asyncio.create_task(load_games())
-    for c in (setmot, sutom, top, add, remove, addmots):
+    for c in (setmot, sutom, top, add, remove, addmots, profil):
         (tree or client.tree).add_command(c)
     app = web.Application()
     app.add_routes([web.get("/", ping), web.get("/ping", ping), web.get("/play/{t}", page),
