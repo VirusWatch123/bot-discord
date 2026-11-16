@@ -15,6 +15,7 @@ db.executescript("""
 CREATE TABLE IF NOT EXISTS admins(guild INT, user INT, PRIMARY KEY(guild,user));
 CREATE TABLE IF NOT EXISTS words(guild INT, day TEXT, word TEXT, PRIMARY KEY(guild,day));
 CREATE TABLE IF NOT EXISTS games(guild INT, user INT, day TEXT, guesses TEXT, done INT, won INT, PRIMARY KEY(guild,user,day));
+CREATE TABLE IF NOT EXISTS extra(guild INT, word TEXT, PRIMARY KEY(guild,word));
 CREATE TABLE IF NOT EXISTS sessions(tok TEXT PRIMARY KEY, guild INT, user INT, channel INT, name TEXT, avatar TEXT, gname TEXT, exp REAL);
 """)
 
@@ -35,6 +36,77 @@ SOURCES = [  # liste de ~336 000 mots français (formes conjuguées et accordée
 for f in ("mots.txt", CACHE):  # un mot par ligne, tu peux aussi poser ton propre mots.txt
     if os.path.exists(f):
         WORDS |= {norm(l) for l in open(f, encoding="utf-8") if l.strip()}
+
+
+GAMES = """
+minecraft creeper enderman ender dragon zombie squelette araignee sorciere villageois pillard golem nether redstone obsidienne
+diamant emeraude netherite lingot pioche epee hache pelle armure bouclier fleche piston creuser miner craft enclume fournaise
+coffre torche lave bedrock herobrine steve alex warden wither blaze ghast piglin hoglin shulker phantom axolotl lama panda renard
+abeille ocelot cochon vache mouton poulet loup cheval tortue dauphin calmar elytres trident boussole potion enchanter
+zelda link ganon ganondorf hyrule triforce navi epona goron zora gerudo kokiri sheikah moblin bokoblin lizalfos octorok mipha urbosa
+revali daruk impa midona tingle ocarina korogu hylien rubis boomerang tektite sidon kass paraglider
+fnaf freddy fazbear bonnie chica foxy springtrap marionnette mangle withered nightmare pizzeria animatronique vanny glitchtrap
+funtime ennard fredbear lefty schmidt balloon bidybab
+fortnite victoire planeur tilted retail pleasant tempete emote skin passe jonesy peely fishstick raven drift midas meowscles
+cuddle lynx loot butin tomate pioche glisse reboot
+roblox robux avatar obby brookhaven bloxburg jailbreak piggy tycoon simulateur noob builderman studio
+pokemon pikachu salameche carapuce bulbizarre evoli ronflex dracaufeu mewtwo pokeball pokedex dresseur miaouss rattata arcanin
+mentali noctali aquali voltali pyroli phyllali givrali nymphali lucario tortank florizarre magicarpe leviator rondoudou togepi
+psykokwak pichu raichu ectoplasma metamorph
+mario luigi peach bowser yoshi toad wario waluigi goomba koopa champignon daisy rosalina kart odyssey
+sonic tails knuckles eggman robotnik
+undertale sans papyrus toriel asgore frisk chara terraria stardew pelican isabelle fallout nuka halo spartan glados freeman skyrim
+geralt sorceleur witcher hollow knight genshin paimon primogemmes overwatch tracer genji reinhardt valorant brawler shelly colt
+brawl clash royale warzone trevor franklin michael
+gamer streamer respawn spawn lag speedrun farm build rush camper headshot sniper boss quete niveau manette console pixel joueur
+imposteur equipage crewmate cafeteria reacteur sabotage
+""".split()
+GAMES_SET = {norm(w) for w in GAMES}
+if os.path.exists("jeux.txt"):  # ajoute ici tes propres mots (un par ligne)
+    GAMES_SET |= {norm(l) for l in open("jeux.txt", encoding="utf-8") if l.strip()}
+
+def extra_ok(guild, g):
+    return g in GAMES_SET or db.execute("SELECT 1 FROM extra WHERE guild=? AND word=?", (guild, g)).fetchone() is not None
+
+
+_GH = "https://raw.githubusercontent.com/killerboyyy777/mc-og-name-hunter/main/data/word_lists/"
+GAME_SOURCES = [  # listes publiques : objets/mobs Minecraft, termes de gamer, personnages de franchises, Pokémon...
+    _GH + "minecraft_items.txt", _GH + "minecraft_ecosystem.txt", _GH + "gaming_terms.txt",
+    _GH + "franchise_characters.txt",
+    "https://raw.githubusercontent.com/cervoise/pentest-scripts/master/password-cracking/wordlists/pokemon-list-en.txt",
+]
+GCACHE = "jeux_web.txt"
+
+def _tokens(text):
+    out = set()
+    for line in text.splitlines():
+        line = line.strip().lower()
+        if not line or line.startswith("#"): continue
+        parts = [p for p in re.split(r"[_\s\-.]+", line) if LETTERS.fullmatch(p)]
+        out |= {norm(p) for p in parts if 3 <= len(p) <= 14}
+        j = "".join(parts)
+        if len(parts) > 1 and 3 <= len(j) <= 14: out.add(norm(j))
+    return out
+
+async def load_games():
+    """Télécharge les listes de mots de jeux au démarrage (puis cache)."""
+    if os.path.exists(GCACHE):
+        GAMES_SET.update(l.strip() for l in open(GCACHE, encoding="utf-8") if l.strip()); return
+    import aiohttp
+    found = set()
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=60)) as ses:
+        for url in GAME_SOURCES:
+            try:
+                async with ses.get(url) as r:
+                    if r.status != 200:
+                        print("[sutom] liste de jeux introuvable", r.status, url); continue
+                    found |= _tokens(await r.text())
+            except Exception as e:
+                print("[sutom] liste de jeux indisponible", url, e)
+    if found:
+        GAMES_SET.update(found)
+        open(GCACHE, "w", encoding="utf-8").write("\n".join(sorted(found)))
+    print(f"[sutom] mots de jeux téléchargés : {len(found)}")
 
 async def load_words():
     """Télécharge le dictionnaire au démarrage (une seule fois, puis cache). Sans lui, tout mot est accepté."""
@@ -131,6 +203,15 @@ async def remove(i: discord.Interaction, membre: discord.Member):
     db.execute("DELETE FROM admins WHERE guild=? AND user=?", (i.guild_id, membre.id)); db.commit()
     await i.response.send_message(f"✅ Accès retiré à {membre.mention}.", ephemeral=True)
 
+@app_commands.command(name="sutom-mots", description="Ajouter des mots acceptés : jeux, personnages... (admins)")
+@app_commands.describe(mots="Mots séparés par des espaces ou des virgules")
+@app_commands.guild_only()
+async def addmots(i: discord.Interaction, mots: str):
+    if not await guard(i): return
+    ws = {norm(w) for w in re.split(r"[\s,;]+", mots) if 3 <= len(norm(w)) <= 14}
+    db.executemany("INSERT OR IGNORE INTO extra VALUES(?,?)", [(i.guild_id, w) for w in ws]); db.commit()
+    await i.response.send_message(f"✅ {len(ws)} mot(s) ajouté(s) à la liste acceptée.", ephemeral=True)
+
 # ───────────────────────────── Serveur web ─────────────────────────────
 def sess(t):
     return db.execute("SELECT guild,user,channel,name,avatar,gname FROM sessions WHERE tok=? AND exp>?", (t, time.time())).fetchone()
@@ -162,7 +243,7 @@ async def guess(r):
     if done: return bad("Partie terminée")
     if len(g) != len(w): return bad(f"Le mot doit faire {len(w)} lettres")
     if g[0] != w[0]: return bad(f"Le mot doit commencer par {w[0]}")
-    if WORDS and g not in WORDS and g != w: return bad("Ce mot n'est pas dans le dictionnaire")
+    if WORDS and g not in WORDS and g != w and not extra_ok(s[0], g): return bad("Ce mot n'est pas dans le dictionnaire")
     gs.append(g); won = g == w; done = won or len(gs) >= MAX
     db.execute("INSERT OR REPLACE INTO games VALUES(?,?,?,?,?,?)", (s[0], s[1], day, json.dumps(gs), int(done), int(won))); db.commit()
     if done: asyncio.create_task(announce(s, gs, w, won))
@@ -273,10 +354,11 @@ S=d;typed=S.first;$('#av').src=S.avatar;$('#nm').textContent=S.name;$('#gn').tex
 
 async def setup(client, tree=None, admin_check=None):
     """À appeler UNE seule fois, avant tree.sync(). admin_check(guild_id, user_id) -> bool est facultatif."""
-    global bot, _admin, _t
+    global bot, _admin, _t, _t2
     bot, _admin = client, admin_check
     _t = asyncio.create_task(load_words())
-    for c in (setmot, sutom, top, add, remove):
+    _t2 = asyncio.create_task(load_games())
+    for c in (setmot, sutom, top, add, remove, addmots):
         (tree or client.tree).add_command(c)
     app = web.Application()
     app.add_routes([web.get("/", ping), web.get("/ping", ping), web.get("/play/{t}", page),
