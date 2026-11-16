@@ -2034,6 +2034,7 @@ class QuizBot(commands.Bot):
         await self.add_cog(Quiz(self, self.db))
         if not SUPPORTS_FILE_UPLOAD:
             log.warning("discord.py trop ancien : champ de fichier désactivé (pip install -U discord.py).")
+        await sutom.setup(self)  # commandes + page du SUTOM (doit passer avant la synchronisation)
         synced = await self.tree.sync()
         log.info("%d commande(s) slash synchronisée(s).", len(synced))
 
@@ -2047,13 +2048,7 @@ def main() -> None:
             "Token introuvable : crée un fichier .env à côté de quiz_bot.py "
             "contenant la ligne DISCORD_TOKEN=ton_token"
         )
-    try:
-        from keep_alive import keep_alive  # facultatif : utile sur Replit
-
-        keep_alive()
-    except ImportError as err:
-        # Le message entre parenthèses donne la vraie raison : « flask » ou « keep_alive » introuvable.
-        log.warning("Keep alive non lancé (%s). Le bot démarre quand même.", err)
+    # Keep alive : assuré par sutom.py (route /ping), l'ancien keep_alive.py n'est plus lancé.
     QuizBot().run(TOKEN, log_handler=None)
 
 
