@@ -4,13 +4,6 @@ import discord
 from discord import app_commands
 from aiohttp import web
 
-try:  # .env en local (jamais commité) ; sur Render on utilise les variables d'environnement
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-TOKEN = os.environ["DISCORD_TOKEN"]          # le token n'est jamais écrit dans le code
 OWNER_ID = 1258814145969782845
 BASE = (os.environ.get("PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "http://localhost:8080").rstrip("/")
 PORT = int(os.environ.get("PORT", 8080))
@@ -51,46 +44,20 @@ def score(g, w):
         if r[i] == 0 and c in left: r[i] = 1; left[left.index(c)] = None
     return r
 
-# ───────────────────────────── Bot Discord ─────────────────────────────
-class Bot(discord.Client):
-    def __init__(self):
-        super().__init__(intents=discord.Intents.default())
-        self.tree = app_commands.CommandTree(self)
+# ───────────────────────────── Intégration ─────────────────────────────
+bot = None
+_admin = None
 
-    async def setup_hook(self):
-        app = web.Application()
-        app.add_routes([web.get("/", ping), web.get("/ping", ping), web.get("/play/{t}", page),
-                        web.get("/api/state/{t}", state), web.post("/api/guess/{t}", guess)])
-        runner = web.AppRunner(app); await runner.setup()
-        await web.TCPSite(runner, "0.0.0.0", PORT).start()   # keep alive : pinge /ping (UptimeRobot)
-        await self.tree.sync()
+async def guard(i):
+    if (_admin or is_admin)(i.guild_id, i.user.id): return True
+    await i.response.send_message("Commande réservée aux admins du bot.", ephemeral=True)
+    return False
 
-    async def on_guild_join(self, guild):  # la personne qui invite le bot devient admin du bot
-        try:
-            async for e in guild.audit_logs(limit=5, action=discord.AuditLogAction.bot_add):
-                if e.target.id == self.user.id:
-                    db.execute("INSERT OR IGNORE INTO admins VALUES(?,?)", (guild.id, e.user.id)); db.commit(); break
-        except Exception:
-            pass
-
-bot = Bot()
-
-def admin_only():
-    async def p(i):
-        if is_admin(i.guild_id, i.user.id): return True
-        await i.response.send_message("Commande réservée aux admins du bot.", ephemeral=True)
-        return False
-    return app_commands.check(p)
-
-@bot.tree.error
-async def on_err(i, e):
-    if not isinstance(e, app_commands.CheckFailure): print(e)
-
-@bot.tree.command(name="sutom-mot", description="Définir le mot du jour (admins)")
+@app_commands.command(name="sutom-mot", description="Définir le mot du jour (admins)")
 @app_commands.describe(mot="Le mot à deviner (5 à 12 lettres)", date="JJ/MM/AAAA (par défaut : aujourd'hui)")
 @app_commands.guild_only()
-@admin_only()
 async def setmot(i: discord.Interaction, mot: str, date: str = None):
+    if not await guard(i): return
     w = norm(mot)
     if not 5 <= len(w) <= 12:
         return await i.response.send_message("Le mot doit faire entre 5 et 12 lettres.", ephemeral=True)
@@ -101,7 +68,7 @@ async def setmot(i: discord.Interaction, mot: str, date: str = None):
     db.execute("INSERT OR REPLACE INTO words VALUES(?,?,?)", (i.guild_id, d, w)); db.commit()
     await i.response.send_message(f"✅ Mot enregistré pour le {d} : ||{w}||", ephemeral=True)
 
-@bot.tree.command(name="sutom", description="Jouer au SUTOM du jour")
+@app_commands.command(name="sutom", description="Jouer au SUTOM du jour")
 @app_commands.guild_only()
 async def sutom(i: discord.Interaction):
     if not current_word(i.guild_id):
@@ -112,7 +79,7 @@ async def sutom(i: discord.Interaction):
     v = discord.ui.View(); v.add_item(discord.ui.Button(label="Ouvrir le SUTOM", emoji="🟥", url=f"{BASE}/play/{tok}"))
     await i.response.send_message("Ta grille est prête. Ce lien est personnel, ne le partage pas.", view=v, ephemeral=True)
 
-@bot.tree.command(name="sutom-classement", description="Classement du serveur")
+@app_commands.command(name="sutom-classement", description="Classement du serveur")
 @app_commands.guild_only()
 async def top(i: discord.Interaction):
     rows = db.execute("SELECT user,SUM(won),COUNT(*) FROM games WHERE guild=? AND done=1 GROUP BY user "
@@ -121,17 +88,17 @@ async def top(i: discord.Interaction):
     await i.response.send_message(embed=discord.Embed(title="🏆 Classement SUTOM", description=txt, color=0xE5162D),
                                   allowed_mentions=discord.AllowedMentions.none())
 
-@bot.tree.command(name="add", description="Donner l'accès aux commandes admin du SUTOM")
+@app_commands.command(name="sutom-add", description="Donner l'accès aux commandes admin du SUTOM")
 @app_commands.guild_only()
-@admin_only()
 async def add(i: discord.Interaction, membre: discord.Member):
+    if not await guard(i): return
     db.execute("INSERT OR IGNORE INTO admins VALUES(?,?)", (i.guild_id, membre.id)); db.commit()
     await i.response.send_message(f"✅ {membre.mention} a maintenant accès aux commandes admin.", ephemeral=True)
 
-@bot.tree.command(name="remove", description="Retirer l'accès aux commandes admin")
+@app_commands.command(name="sutom-remove", description="Retirer l'accès aux commandes admin")
 @app_commands.guild_only()
-@admin_only()
 async def remove(i: discord.Interaction, membre: discord.Member):
+    if not await guard(i): return
     db.execute("DELETE FROM admins WHERE guild=? AND user=?", (i.guild_id, membre.id)); db.commit()
     await i.response.send_message(f"✅ Accès retiré à {membre.mention}.", ephemeral=True)
 
@@ -265,4 +232,14 @@ const[ok,d]=await api('state');if(!ok){$('#app').innerHTML='<p class="err">'+d.e
 S=d;typed=S.first;$('#av').src=S.avatar;$('#nm').textContent=S.name;build();keys();paint();ukeys();if(S.done)end(false)})();
 </script></body></html>'''
 
-bot.run(TOKEN)
+async def setup(client, tree=None, admin_check=None):
+    """À appeler UNE seule fois, avant tree.sync(). admin_check(guild_id, user_id) -> bool est facultatif."""
+    global bot, _admin
+    bot, _admin = client, admin_check
+    for c in (setmot, sutom, top, add, remove):
+        (tree or client.tree).add_command(c)
+    app = web.Application()
+    app.add_routes([web.get("/", ping), web.get("/ping", ping), web.get("/play/{t}", page),
+                    web.get("/api/state/{t}", state), web.post("/api/guess/{t}", guess)])
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()   # sert aussi de keep alive (/ping)
