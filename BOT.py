@@ -2035,6 +2035,10 @@ class QuizBot(commands.Bot):
         if not SUPPORTS_FILE_UPLOAD:
             log.warning("discord.py trop ancien : champ de fichier désactivé (pip install -U discord.py).")
         await sutom.setup(self)  # commandes + page du SUTOM (doit passer avant la synchronisation)
+        try:
+            await self.load_extension("economie")  # système d'économie et de boutique (economie.py)
+        except Exception:
+            log.exception("Impossible de charger economie.py : le bot continue sans l'économie.")
         synced = await self.tree.sync()
         log.info("%d commande(s) slash synchronisée(s).", len(synced))
 
