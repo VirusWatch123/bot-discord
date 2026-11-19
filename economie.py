@@ -3,7 +3,7 @@ economie.py : économie et boutique (cog discord.py 2.x + SQLite) avec panneau d
 
 Chargement dans ton bot :  await bot.load_extension("economie")
 
-Administration (réservée à la personne qui a invité le bot et à ECO_OWNER_ID) :
+Administration (réservée à ECO_OWNER_ID, au propriétaire défini dans BOT.py et à la personne qui a invité le bot) :
     /ecoconfig   panneau complet : réglages, boutique, membres, événements, journal
     /addmoney    ajouter de l'argent à un membre
     /removemoney retirer de l'argent à un membre
@@ -16,7 +16,7 @@ from typing import Callable, Optional
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 # ───────────────────────── Réglages fixes ─────────────────────────
 DB_PATH = os.getenv("ECO_DB_PATH", "economie.db")   # fichier séparé de la base du quiz
@@ -45,6 +45,11 @@ RARITIES = {
 }
 KINDS = {"collection": "Collection", "role": "Rôle", "boost": "Boost de gains", "coffre": "Coffre"}
 
+ROB_STEAL = (10, 30)   # % du portefeuille de la victime volés en cas de réussite
+ROB_FINE = (10, 25)    # % du portefeuille du voleur payés en cas d'échec
+COINFLIP_MAX_OPEN = 3  # paris coinflip ouverts en même temps par membre
+OTHER_SIDE = {"pile": "face", "face": "pile"}
+
 SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "🔔", "⭐", "💎", "7️⃣"]
 SLOT_WEIGHTS = [30, 25, 20, 12, 7, 4, 2]
 SLOT_TRIPLE = {"🍒": 3, "🍋": 4, "🍇": 6, "🔔": 10, "⭐": 15, "💎": 30, "7️⃣": 60}
@@ -53,7 +58,7 @@ BIG = 10 ** 9
 # Réglages modifiables depuis le panneau : clé -> (section, libellé, type, défaut, min, max)
 # (pour le type « text », min / max = longueur du texte)
 SETTINGS = {
-    "currency": ("general", "Symbole de la monnaie", "text", "🪙", 1, 40),
+    "currency": ("general", "Nom / symbole de la monnaie", "text", "rubis", 1, 40),
     "start_wallet": ("general", "Solde de départ des nouveaux membres", "int", 100, 0, BIG),
     "shop_open": ("general", "Boutique ouverte", "bool", 1, 0, 1),
     "sell_ratio": ("general", "Prix de revente (% du prix d'achat)", "int", 50, 0, 100),
@@ -69,8 +74,10 @@ SETTINGS = {
     "msg_min": ("gains", "Gain minimum par message", "int", 1, 0, 1_000_000),
     "msg_max": ("gains", "Gain maximum par message", "int", 5, 0, 1_000_000),
     "msg_cd": ("gains", "Délai entre deux gains de message (s)", "int", 60, 5, 3600),
-    "games_enabled": ("games", "Jeux d'argent (pile ou face, machine à sous)", "bool", 1, 0, 1),
-    "max_bet": ("games", "Mise maximale", "int", 100_000, 1, BIG),
+    "games_enabled": ("games", "Jeux d'argent (coinflip, machine à sous)", "bool", 1, 0, 1),
+    "max_bet": ("games", "Mise maximale de la machine à sous", "int", 100_000, 1, BIG),
+    "coinflip_max": ("games", "Mise maximale du coinflip", "int", 5000, 1, BIG),
+    "coinflip_ttl": ("games", "Durée de vie d'un pari coinflip (minutes)", "int", 30, 1, 1440),
     "rob_enabled": ("games", "Vol entre membres (/rob)", "bool", 1, 0, 1),
     "rob_chance": ("games", "Chances de réussite du vol (%)", "int", 40, 1, 95),
     "rob_cd": ("games", "Délai du /rob (minutes)", "int", 120, 1, 1440),
@@ -110,6 +117,9 @@ CREATE TABLE IF NOT EXISTS transactions(
     delta INTEGER, reason TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS settings(
     guild_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (guild_id, key));
+CREATE TABLE IF NOT EXISTS coinflips(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, creator_id INTEGER NOT NULL,
+    amount INTEGER NOT NULL, side TEXT NOT NULL, created REAL NOT NULL);
 """
 
 
@@ -1065,6 +1075,135 @@ class LogPanel(AdminView):
         await self.go(interaction, MainPanel(self.cog, self.origin))
 
 
+# ---------- Coinflip entre membres ----------
+class CoinflipModal(ErrorModal):
+    def __init__(self, lobby: "CoinflipView", side: str):
+        super().__init__(title=f"Coinflip : tu prends {side}"[:45])
+        self.lobby, self.side = lobby, side
+        maxi = lobby.cog.store.cfg(lobby.g, "coinflip_max")
+        self.f_amount = discord.ui.TextInput(
+            label="Ta mise (nombre, tout ou moitié)", placeholder=f"Maximum : {num(maxi)}", max_length=14)
+        self.add_item(self.f_amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        lobby = self.lobby
+        res, err = lobby.cog.create_coinflip(lobby.g, interaction.user.id, self.side, self.f_amount.value)
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
+        lobby.rebuild()
+        await interaction.response.edit_message(embed=lobby.embed(), view=lobby)
+        try:
+            await interaction.channel.send(embed=lobby.cog.coinflip_created_embed(lobby.g, interaction.user, res),
+                                           allowed_mentions=discord.AllowedMentions.none())
+        except (discord.HTTPException, AttributeError):
+            pass
+
+
+class CoinflipView(discord.ui.View):
+    """Liste des paris coinflip ouverts : on en relève un, ou on crée le sien."""
+
+    def __init__(self, cog, origin: discord.Interaction):
+        super().__init__(timeout=180)
+        self.cog, self.origin = cog, origin
+        self.g, self.uid = origin.guild_id, origin.user.id
+        self.rebuild()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.origin.user.id:
+            await interaction.response.send_message("Tape `/coinflip` pour ouvrir ta propre liste.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for c in self.children:
+            c.disabled = True
+        try:
+            await self.origin.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
+    def rebuild(self):
+        self.cog.refund_expired_coinflips(self.g)
+        self.clear_items()
+        rows = self.cog.open_coinflips(self.g)
+        others = [r for r in rows if r["creator_id"] != self.uid][:25]
+        guild = self.origin.guild
+        if others:
+            opts = []
+            for r in others:
+                member = guild.get_member(r["creator_id"]) if guild else None
+                opts.append(discord.SelectOption(
+                    label=f"{self.cog.m(self.g, r['amount'])} · {member.display_name if member else 'un membre'}"[:100],
+                    value=str(r["id"]),
+                    description=f"Tu auras {OTHER_SIDE[r['side']]} (il a pris {r['side']})"[:100]))
+            sel = discord.ui.Select(placeholder="Relever un pari…", options=opts, row=0)
+            sel.callback = self.on_join
+            self.add_item(sel)
+        self.b_cancel.disabled = not any(r["creator_id"] == self.uid for r in rows)
+        for b in (self.b_pile, self.b_face, self.b_cancel, self.b_refresh):
+            self.add_item(b)
+
+    def embed(self):
+        g, m = self.g, self.cog.m
+        rows = self.cog.open_coinflips(g)
+        ttl = self.cog.store.cfg(g, "coinflip_ttl") * 60
+        e = discord.Embed(title="🪙 Coinflips disponibles", color=0xF1C40F)
+        if rows:
+            lines = [f"**#{r['id']}** · <@{r['creator_id']}> met **{m(g, r['amount'])}** sur **{r['side']}** · "
+                     f"expire <t:{int(r['created'] + ttl)}:R>" + (" · *(le tien)*" if r["creator_id"] == self.uid else "")
+                     for r in rows[:15]]
+            e.description = "\n".join(lines)
+        else:
+            e.description = "Aucun pari disponible pour le moment.\nCrée le tien avec les boutons ci-dessous !"
+        e.add_field(
+            name="Comment ça marche ?",
+            value=("Un joueur met une mise en jeu et choisit **pile** ou **face**. Un autre membre relève le pari avec la "
+                   "même mise et prend l'autre côté. La pièce est lancée : **le gagnant empoche les deux mises, "
+                   "le perdant perd la sienne**."), inline=False)
+        wallet = self.cog.store.user(g, self.uid)["wallet"]
+        e.set_footer(text=f"Mise max : {m(g, self.cog.store.cfg(g, 'coinflip_max'))} · Ton portefeuille : {m(g, wallet)}")
+        return e
+
+    async def on_join(self, interaction: discord.Interaction):
+        res, err = self.cog.join_coinflip(self.g, interaction.user.id, int(interaction.data["values"][0]))
+        self.rebuild()
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            try:
+                await self.origin.edit_original_response(embed=self.embed(), view=self)
+            except discord.HTTPException:
+                pass
+            return
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+        e = self.cog.coinflip_result_embed(self.g, res)
+        mentions = discord.AllowedMentions(users=[discord.Object(id=res["creator"]), discord.Object(id=res["joiner"])])
+        try:
+            await interaction.channel.send(content=f"<@{res['creator']}> <@{res['joiner']}>", embed=e,
+                                           allowed_mentions=mentions)
+        except (discord.HTTPException, AttributeError):
+            await interaction.followup.send(embed=e, allowed_mentions=mentions)
+
+    @discord.ui.button(label="Créer : pile", emoji="🪙", style=discord.ButtonStyle.success, row=1)
+    async def b_pile(self, interaction, button):
+        await interaction.response.send_modal(CoinflipModal(self, "pile"))
+
+    @discord.ui.button(label="Créer : face", emoji="🪙", style=discord.ButtonStyle.success, row=1)
+    async def b_face(self, interaction, button):
+        await interaction.response.send_modal(CoinflipModal(self, "face"))
+
+    @discord.ui.button(label="Annuler mes paris", emoji="↩️", style=discord.ButtonStyle.danger, row=1)
+    async def b_cancel(self, interaction, button):
+        n, total = self.cog.cancel_coinflips(self.g, interaction.user.id)
+        self.rebuild()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+        await interaction.followup.send(f"↩️ {n} pari(s) annulé(s) : {self.cog.m(self.g, total)} rendus.", ephemeral=True)
+
+    @discord.ui.button(label="Actualiser", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def b_refresh(self, interaction, button):
+        self.rebuild()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
 # ───────────────────────── Cog ─────────────────────────
 class Economie(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -1075,23 +1214,42 @@ class Economie(commands.Cog):
     async def cog_load(self):
         self.store.db.execute("DELETE FROM boosts WHERE expires<=?", (time.time(),))
         self.store.db.commit()
+        self.refund_expired_coinflips()
+        self.coinflip_cleanup.start()
+
+    async def cog_unload(self):
+        self.coinflip_cleanup.cancel()
+
+    @tasks.loop(seconds=60)
+    async def coinflip_cleanup(self):
+        self.refund_expired_coinflips()
+
+    @coinflip_cleanup.before_loop
+    async def _before_coinflip_cleanup(self):
+        await self.bot.wait_until_ready()
 
     # ---- outils ----
     def m(self, g, n) -> str:
         return self.store.money(g, n)
 
     def can_admin(self, user_id: int, guild_id: Optional[int]) -> bool:
-        """Toi (ECO_OWNER_ID) ou la personne qui a invité le bot sur ce serveur (table du bot de quiz)."""
+        """Toi (ECO_OWNER_ID), le propriétaire défini dans BOT.py, ou la personne qui a invité le bot ici."""
         if user_id == ECO_OWNER_ID:
             return True
         quiz_db = getattr(self.bot, "db", None)
-        return bool(guild_id and quiz_db is not None and hasattr(quiz_db, "is_guild_admin")
-                    and quiz_db.is_guild_admin(guild_id, user_id))
+        if quiz_db is None:
+            return False
+        manage = getattr(quiz_db, "can_manage_access", None)   # OWNER_ID de BOT.py ou inviteur du bot
+        if manage is not None:
+            return bool(manage(user_id, guild_id))
+        is_admin = getattr(quiz_db, "is_guild_admin", None)
+        return bool(guild_id and is_admin is not None and is_admin(guild_id, user_id))
 
     async def require_admin(self, interaction: discord.Interaction) -> bool:
         if not self.can_admin(interaction.user.id, interaction.guild_id):
             await interaction.response.send_message(
-                "⛔ Cette commande est réservée à la personne qui a invité le bot.", ephemeral=True)
+                "⛔ Cette commande est réservée à la personne qui a invité le bot et au propriétaire du bot.\n"
+                f"Ton ID Discord : `{interaction.user.id}`", ephemeral=True)
             return False
         return True
 
@@ -1324,10 +1482,46 @@ class Economie(commands.Cog):
         await interaction.response.send_message(
             f"💸 {interaction.user.mention} a envoyé **{self.m(g, montant)}** à {membre.mention}.")
 
-    @app_commands.command(name="rob", description="Tenter de voler le portefeuille d'un membre")
+    def rob_rules_embed(self, g) -> discord.Embed:
+        cfg = self.store.cfg
+        p = cfg(g, "rob_chance") / 100
+        steal, fine = sum(ROB_STEAL) / 2, sum(ROB_FINE) / 2          # moyennes (tirage uniforme)
+        ev = lambda victim, thief: p * victim * steal / 100 - (1 - p) * thief * fine / 100
+        ratio = ((1 - p) * fine) / (p * steal)
+        cd = cfg(g, "rob_cd")
+        cd_txt = (f"{cd // 60} h" + (f" {cd % 60} min" if cd % 60 else "")) if cd >= 60 else f"{cd} min"
+        e = discord.Embed(
+            title="🦹 Le vol : règles et probabilités", color=0xE67E22,
+            description="**But** : piquer une partie de l'argent **du portefeuille** d'un autre membre. "
+                        "Plus ta cible est riche, plus le gain potentiel est gros… mais un échec te coûte cher.")
+        e.add_field(name="🎲 Chances", value=f"**{p * 100:.0f} %** de réussite · **{(1 - p) * 100:.0f} %** d'échec", inline=False)
+        e.add_field(name="✅ Si ça réussit",
+                    value=f"Tu voles **{ROB_STEAL[0]} à {ROB_STEAL[1]} %** du portefeuille de ta cible (≈ {steal:g} % en moyenne).",
+                    inline=False)
+        e.add_field(name="🚓 Si tu te fais attraper",
+                    value=f"Tu paies une amende de **{ROB_FINE[0]} à {ROB_FINE[1]} %** de **ton** portefeuille, "
+                          f"versée à ta cible (≈ {fine:g} % en moyenne).", inline=False)
+        e.add_field(name="🛡️ Se protéger",
+                    value="La banque est intouchable : seul le portefeuille peut être volé. "
+                          "Utilise `/deposit` pour mettre ton argent à l'abri.", inline=False)
+        e.add_field(name="⏳ Conditions",
+                    value=f"Un vol toutes les **{cd_txt}** · toi et ta cible devez avoir au moins "
+                          f"**{self.m(g, cfg(g, 'rob_min'))}** en portefeuille.", inline=False)
+        e.add_field(name="📊 Est-ce rentable ?",
+                    value=(f"En moyenne, un vol ne rapporte que si ta cible a plus de **{ratio:.1f}×** ton portefeuille.\n"
+                           f"• Cible {self.m(g, 2000)} / toi {self.m(g, 1000)} : **{round(ev(2000, 1000)):+d}** par essai en moyenne\n"
+                           f"• Cible {self.m(g, 1000)} / toi {self.m(g, 1000)} : **{round(ev(1000, 1000)):+d}** par essai en moyenne"),
+                    inline=False)
+        e.set_footer(text="Tente ta chance avec /rob @membre")
+        return e
+
+    @app_commands.command(name="rob", description="Voler le portefeuille d'un membre (sans cible : règles et probabilités)")
+    @app_commands.describe(membre="La cible du vol (laisse vide pour voir les règles et les probabilités)")
     @app_commands.guild_only()
-    async def rob(self, interaction: discord.Interaction, membre: discord.Member):
+    async def rob(self, interaction: discord.Interaction, membre: Optional[discord.Member] = None):
         g, u, now, cfg = interaction.guild_id, interaction.user.id, time.time(), self.store.cfg
+        if membre is None:
+            return await interaction.response.send_message(embed=self.rob_rules_embed(g), ephemeral=True)
         if not cfg(g, "rob_enabled"):
             return await interaction.response.send_message("🚫 Le vol est désactivé sur ce serveur.", ephemeral=True)
         if membre.bot or membre.id == u:
@@ -1345,23 +1539,26 @@ class Economie(commands.Cog):
             return await interaction.response.send_message(
                 f"❌ Il te faut au moins {self.m(g, minimum)} en portefeuille pour tenter un vol.", ephemeral=True)
         self.store.db.execute("UPDATE users SET last_rob=? WHERE guild_id=? AND user_id=?", (now, g, u))
-        if random.random() < cfg(g, "rob_chance") / 100:
-            lo = max(1, victim["wallet"] // 10)
-            amount = random.randint(lo, max(lo, victim["wallet"] * 30 // 100))
+        chance = cfg(g, "rob_chance")
+        if random.random() < chance / 100:
+            lo = max(1, victim["wallet"] * ROB_STEAL[0] // 100)
+            amount = random.randint(lo, max(lo, victim["wallet"] * ROB_STEAL[1] // 100))
             self.store.add(g, membre.id, wallet=-amount, reason=f"Volé par {u}")
             self.store.add(g, u, wallet=amount, reason=f"Vol sur {membre.id}")
             msg = f"🦹 {interaction.user.mention} a volé **{self.m(g, amount)}** à {membre.mention} !"
             color = 0xE67E22
         else:
-            lo = max(1, thief["wallet"] // 10)
-            fine = random.randint(lo, max(lo, thief["wallet"] // 4))
+            lo = max(1, thief["wallet"] * ROB_FINE[0] // 100)
+            fine = random.randint(lo, max(lo, thief["wallet"] * ROB_FINE[1] // 100))
             self.store.add(g, u, wallet=-fine, reason=f"Amende (vol raté sur {membre.id})")
             self.store.add(g, membre.id, wallet=fine, reason=f"Indemnité (vol raté de {u})")
             msg = (f"🚓 {interaction.user.mention} s'est fait attraper ! "
                    f"Amende de **{self.m(g, fine)}** versée à {membre.mention}.")
             color = 0xE74C3C
         self.store.db.commit()
-        await interaction.response.send_message(embed=discord.Embed(description=msg, color=color))
+        e = discord.Embed(description=msg, color=color)
+        e.set_footer(text=f"Chances de réussite : {chance} % · /rob sans cible = règles détaillées")
+        await interaction.response.send_message(embed=e)
 
     def _bet(self, g, u, raw: str):
         """Valide une mise ; retourne (mise, message d'erreur)."""
@@ -1375,24 +1572,123 @@ class Economie(commands.Cog):
             return None, f"❌ Mise invalide (maximum {self.m(g, maxi)})."
         return bet, None
 
-    @app_commands.command(name="coinflip", description="Pile ou face : double ta mise ou perds-la")
-    @app_commands.describe(mise="Un nombre, « tout », « moitié » ou un pourcentage")
+    # ---- coinflip entre membres ----
+    def open_coinflips(self, g):
+        return self.store.db.execute("SELECT * FROM coinflips WHERE guild_id=? ORDER BY created", (g,)).fetchall()
+
+    def refund_expired_coinflips(self, g: Optional[int] = None) -> int:
+        """Rend leur mise aux créateurs des paris trop anciens ; retourne le nombre de paris remboursés."""
+        s, now, n = self.store, time.time(), 0
+        rows = (s.db.execute("SELECT * FROM coinflips").fetchall() if g is None else
+                s.db.execute("SELECT * FROM coinflips WHERE guild_id=?", (g,)).fetchall())
+        for r in rows:
+            if now - r["created"] > s.cfg(r["guild_id"], "coinflip_ttl") * 60:
+                s.user(r["guild_id"], r["creator_id"])
+                s.add(r["guild_id"], r["creator_id"], wallet=r["amount"], reason="Coinflip expiré (mise rendue)")
+                s.db.execute("DELETE FROM coinflips WHERE id=?", (r["id"],))
+                n += 1
+        if n:
+            s.db.commit()
+        return n
+
+    def create_coinflip(self, g, u, side: str, raw_amount: str):
+        """Crée un pari : la mise est bloquée tout de suite. Retourne (pari, None) ou (None, erreur)."""
+        s, cfg = self.store, self.store.cfg
+        if not cfg(g, "games_enabled"):
+            return None, "🚫 Les jeux d'argent sont désactivés sur ce serveur."
+        self.refund_expired_coinflips(g)
+        wallet = s.user(g, u)["wallet"]
+        maxi = cfg(g, "coinflip_max")
+        amount = parse_amount(raw_amount, min(wallet, maxi))
+        if not amount or amount < 1:
+            return None, "❌ Mise invalide."
+        if amount > maxi:
+            return None, f"❌ La mise maximale du coinflip est de {self.m(g, maxi)}."
+        if amount > wallet:
+            return None, f"❌ Il te manque {self.m(g, amount - wallet)} dans ton portefeuille."
+        mine = s.db.execute("SELECT COUNT(*) FROM coinflips WHERE guild_id=? AND creator_id=?", (g, u)).fetchone()[0]
+        if mine >= COINFLIP_MAX_OPEN:
+            return None, f"❌ Tu as déjà {COINFLIP_MAX_OPEN} paris ouverts : attends qu'ils soient relevés ou annule-en un."
+        s.add(g, u, wallet=-amount, reason="Coinflip créé (mise bloquée)")
+        cur = s.db.execute("INSERT INTO coinflips(guild_id,creator_id,amount,side,created) VALUES(?,?,?,?,?)",
+                           (g, u, amount, side, time.time()))
+        s.db.commit()
+        return dict(id=cur.lastrowid, amount=amount, side=side), None
+
+    def join_coinflip(self, g, u, cf_id: int):
+        """Relève un pari : lance la pièce, le gagnant prend les deux mises. Retourne (résultat, None) ou (None, erreur)."""
+        s = self.store
+        if not s.cfg(g, "games_enabled"):
+            return None, "🚫 Les jeux d'argent sont désactivés sur ce serveur."
+        self.refund_expired_coinflips(g)
+        cf = s.db.execute("SELECT * FROM coinflips WHERE id=? AND guild_id=?", (cf_id, g)).fetchone()
+        if not cf:
+            return None, "❌ Ce pari n'est plus disponible (déjà relevé, annulé ou expiré)."
+        if cf["creator_id"] == u:
+            return None, "❌ Tu ne peux pas relever ton propre pari."
+        wallet = s.user(g, u)["wallet"]
+        if wallet < cf["amount"]:
+            return None, f"❌ Il te manque {self.m(g, cf['amount'] - wallet)} pour relever ce pari."
+        s.db.execute("DELETE FROM coinflips WHERE id=?", (cf_id,))
+        result = random.choice(["pile", "face"])
+        creator_wins = result == cf["side"]
+        winner, loser = (cf["creator_id"], u) if creator_wins else (u, cf["creator_id"])
+        s.add(g, u, wallet=-cf["amount"], reason="Coinflip : mise")
+        s.user(g, cf["creator_id"])
+        s.add(g, winner, wallet=cf["amount"] * 2, reason="Coinflip gagné")
+        s.db.commit()
+        return dict(result=result, winner=winner, loser=loser, amount=cf["amount"], creator=cf["creator_id"],
+                    creator_side=cf["side"], joiner=u), None
+
+    def cancel_coinflips(self, g, u):
+        s = self.store
+        rows = s.db.execute("SELECT * FROM coinflips WHERE guild_id=? AND creator_id=?", (g, u)).fetchall()
+        total = sum(r["amount"] for r in rows)
+        if rows:
+            s.user(g, u)
+            s.add(g, u, wallet=total, reason="Coinflip annulé (mise rendue)")
+            s.db.execute("DELETE FROM coinflips WHERE guild_id=? AND creator_id=?", (g, u))
+            s.db.commit()
+        return len(rows), total
+
+    def coinflip_created_embed(self, g, user, res) -> discord.Embed:
+        return discord.Embed(
+            title="🪙 Nouveau coinflip", color=0xF1C40F,
+            description=(f"{user.mention} met **{self.m(g, res['amount'])}** en jeu et prend **{res['side']}**.\n"
+                         f"Tape `/coinflip` pour relever le pari : tu auras **{OTHER_SIDE[res['side']]}**. "
+                         "Le gagnant empoche les deux mises."))
+
+    def coinflip_result_embed(self, g, r) -> discord.Embed:
+        return discord.Embed(
+            title="🪙 Coinflip", color=0xF1C40F,
+            description=(f"La pièce tombe sur **{r['result']}** !\n"
+                         f"🏆 <@{r['winner']}> remporte **{self.m(g, r['amount'] * 2)}** "
+                         f"(mise de {self.m(g, r['amount'])} chacun).\n"
+                         f"💀 <@{r['loser']}> perd sa mise."))
+
+    @app_commands.command(name="coinflip", description="Parier pile ou face contre un autre membre (le gagnant prend les deux mises)")
+    @app_commands.describe(choix="Ton côté de la pièce (pour créer un pari directement)",
+                           mise="Ta mise (pour créer un pari directement)")
     @app_commands.choices(choix=[app_commands.Choice(name="Pile", value="pile"),
                                  app_commands.Choice(name="Face", value="face")])
     @app_commands.guild_only()
-    async def coinflip(self, interaction: discord.Interaction, choix: str, mise: str):
+    async def coinflip(self, interaction: discord.Interaction, choix: Optional[str] = None, mise: Optional[str] = None):
         g, u = interaction.guild_id, interaction.user.id
-        bet, err = self._bet(g, u, mise)
-        if err:
-            return await interaction.response.send_message(err, ephemeral=True)
-        result = random.choice(["pile", "face"])
-        win = result == choix
-        self.store.add(g, u, wallet=bet if win else -bet, reason="Pile ou face")
-        self.store.db.commit()
-        txt = f"La pièce tombe sur **{result}** : " + (
-            f"tu gagnes **{self.m(g, bet)}** 🎉" if win else f"tu perds **{self.m(g, bet)}** 😢")
-        await interaction.response.send_message(embed=discord.Embed(
-            description=txt, color=0x2ECC71 if win else 0xE74C3C))
+        if not self.store.cfg(g, "games_enabled"):
+            return await interaction.response.send_message("🚫 Les jeux d'argent sont désactivés sur ce serveur.", ephemeral=True)
+        if (choix is None) != (mise is None):
+            return await interaction.response.send_message(
+                "❌ Pour créer un pari directement, indique à la fois `choix` et `mise`. "
+                "Sans option, `/coinflip` affiche les paris disponibles.", ephemeral=True)
+        if choix and mise:
+            res, err = self.create_coinflip(g, u, choix, mise)
+            if err:
+                return await interaction.response.send_message(err, ephemeral=True)
+            return await interaction.response.send_message(
+                embed=self.coinflip_created_embed(g, interaction.user, res),
+                allowed_mentions=discord.AllowedMentions.none())
+        view = CoinflipView(self, interaction)
+        await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
     @app_commands.command(name="slots", description="Machine à sous")
     @app_commands.describe(mise="Un nombre, « tout », « moitié » ou un pourcentage")
