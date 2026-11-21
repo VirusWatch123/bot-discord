@@ -4,9 +4,11 @@ economie.py : économie et boutique (cog discord.py 2.x + SQLite) avec panneau d
 Chargement dans ton bot :  await bot.load_extension("economie")
 
 Administration (réservée à ECO_OWNER_ID, au propriétaire défini dans BOT.py et à la personne qui a invité le bot) :
-    /ecoconfig   panneau complet : réglages, boutique, membres, événements, journal
-    /addmoney    ajouter de l'argent à un membre
-    /removemoney retirer de l'argent à un membre
+    /eco config       panneau complet : réglages, boutique, membres, événements, journal
+    /eco addmoney     ajouter de l'argent à un membre
+    /eco removemoney  retirer de l'argent à un membre
+
+Toutes les commandes de l'économie sont regroupées sous /eco (une seule entrée dans la liste de Discord).
 """
 import logging
 import os
@@ -24,21 +26,6 @@ from discord.ext import commands, tasks
 DB_PATH = os.getenv("ECO_DB_PATH", "economie.db")   # fichier séparé de la base du quiz
 ECO_OWNER_ID = 1572724368029646999                  # toi : accès à l'administration partout
 
-JOBS = [  # (nombre de /work requis, métier, gain min, gain max)
-    (0, "Stagiaire", 30, 70),
-    (5, "Livreur", 50, 110),
-    (15, "Serveur", 90, 170),
-    (35, "Développeur", 150, 280),
-    (70, "Ingénieur", 240, 420),
-    (120, "Directeur", 380, 700),
-]
-WORK_TEXTS = [
-    "Tu as terminé une grosse mission",
-    "Un client est ravi de ton travail",
-    "Tu as fait des heures supplémentaires",
-    "Ta journée a été très productive",
-    "Ton patron t'a glissé une prime",
-]
 RARITIES = {
     "commun": ("⚪", "Commun"),
     "rare": ("🔵", "Rare"),
@@ -47,10 +34,10 @@ RARITIES = {
 }
 KINDS = {"collection": "Collection", "role": "Rôle", "boost": "Boost de gains", "coffre": "Coffre"}
 KIND_HELP = {
-    "collection": "Objet de collection : aucun effet, juste le plaisir de le posséder.",
-    "role": "Donne un rôle Discord au membre quand il utilise l'objet avec /use (l'objet est alors consommé).",
-    "boost": "Augmente les gains du membre pendant un certain temps quand il utilise l'objet avec /use.",
-    "coffre": "Quand il l'ouvre avec /use, le membre reçoit un montant au hasard entre 25 % de la récompense maximale et la récompense maximale.",
+    "collection": "Objet de collection : aucun effet. Il va dans l'inventaire du membre (il peut le revendre avec /eco sell).",
+    "role": "Le membre reçoit le rôle Discord dès l'achat.",
+    "boost": "Dès l'achat, les gains du membre augmentent pendant un certain temps.",
+    "coffre": "Dès l'achat, le coffre s'ouvre : le membre reçoit un montant au hasard entre 25 % de la récompense maximale et la récompense maximale.",
 }
 
 ROB_STEAL = (10, 30)   # % du portefeuille de la victime volés en cas de réussite
@@ -60,6 +47,7 @@ OTHER_SIDE = {"pile": "face", "face": "pile"}
 
 SLOT_SYMBOLS = ["🍒", "🍋", "🍇", "🔔", "⭐", "💎", "7️⃣"]
 SLOT_WEIGHTS = [30, 25, 20, 12, 7, 4, 2]
+SLOT_PAIR = 1.5   # multiplicateur quand exactement deux symboles sont identiques
 SLOT_TRIPLE = {"🍒": 3, "🍋": 4, "🍇": 6, "🔔": 10, "⭐": 15, "💎": 30, "7️⃣": 60}
 
 BIG = 10 ** 9
@@ -77,23 +65,15 @@ SETTINGS = {
     "shop_open": ("general", "Boutique ouverte", "bool", 1, 0, 1,
                   "Si tu la fermes, plus personne ne peut ouvrir la boutique ni acheter. Tes objets sont conservés."),
     "sell_ratio": ("general", "Prix de revente (% du prix d'achat)", "int", 50, 0, 100,
-                   "Quand un membre revend un objet avec /sell, il récupère ce pourcentage du prix. 50 = la moitié."),
+                   "Quand un membre revend un objet avec /eco sell, il récupère ce pourcentage du prix. 50 = la moitié."),
     "bonus_cap": ("general", "Bonus de gains maximum cumulé (%)", "int", 300, 0, 1000,
                   "Les boosts (objets et événements) s'additionnent : ce plafond limite le total. 300 = gains ×4 au maximum."),
-    "daily_base": ("gains", "Récompense /daily de base", "int", 250, 0, BIG,
-                   "Montant reçu avec /daily le premier jour de la série."),
-    "daily_step": ("gains", "Bonus de série /daily (par jour d'affilée)", "int", 25, 0, BIG,
+    "daily_base": ("gains", "Récompense /eco daily de base", "int", 250, 0, BIG,
+                   "Montant reçu avec /eco daily le premier jour de la série."),
+    "daily_step": ("gains", "Bonus de série /eco daily (par jour d'affilée)", "int", 25, 0, BIG,
                    "Montant ajouté pour chaque jour d'affilée (30 jours max). Ex. base 250 et bonus 25 : 275 le 2e jour."),
-    "daily_cd": ("gains", "Délai du /daily (heures)", "int", 24, 1, 720,
-                 "Temps à attendre entre deux /daily. Si un membre attend plus du double, sa série repart de zéro."),
-    "work_cd": ("gains", "Délai du /work (minutes)", "int", 60, 1, 1440,
-                "Temps à attendre entre deux /work."),
-    "work_mult": ("gains", "Multiplicateur des salaires /work (%)", "int", 100, 10, 1000,
-                  "100 = salaire normal, 200 = salaire doublé, 50 = salaire divisé par deux."),
-    "interest_pct": ("gains", "Intérêts bancaires avec /daily (%)", "int", 1, 0, 100,
-                     "À chaque /daily, la banque du membre augmente de ce pourcentage. 1 = +1 %."),
-    "interest_max": ("gains", "Plafond des intérêts par /daily", "int", 2000, 0, BIG,
-                     "Les intérêts d'un /daily ne dépassent jamais ce montant (évite que les très riches explosent)."),
+    "daily_cd": ("gains", "Délai du /eco daily (heures)", "int", 24, 1, 720,
+                 "Temps à attendre entre deux /eco daily. Si un membre attend plus du double, sa série repart de zéro."),
     "msg_enabled": ("gains", "Gains en discutant", "bool", 1, 0, 1,
                     "Les membres gagnent un peu d'argent en écrivant des messages dans le serveur."),
     "msg_min": ("gains", "Gain minimum par message", "int", 1, 0, 1_000_000,
@@ -103,18 +83,18 @@ SETTINGS = {
     "msg_cd": ("gains", "Délai entre deux gains de message (s)", "int", 60, 5, 3600,
                "Anti-spam : un membre ne gagne qu'une fois par ce délai. 60 = 1 gain par minute au maximum."),
     "games_enabled": ("games", "Jeux d'argent (coinflip, machine à sous)", "bool", 1, 0, 1,
-                      "Active ou coupe /coinflip et /slots."),
+                      "Active ou coupe /eco coinflip et /eco slots."),
     "max_bet": ("games", "Mise maximale de la machine à sous", "int", 100_000, 1, BIG,
-                "Plus grosse mise acceptée à /slots."),
+                "Plus grosse mise acceptée à /eco slots."),
     "coinflip_max": ("games", "Mise maximale du coinflip", "int", 5000, 1, BIG,
-                     "Plus grosse mise acceptée pour un pari /coinflip entre membres."),
+                     "Plus grosse mise acceptée pour un pari /eco coinflip entre membres."),
     "coinflip_ttl": ("games", "Durée de vie d'un pari coinflip (minutes)", "int", 2880, 1, 20160,
                      "Au bout de ce temps, un pari que personne n'a relevé expire et la mise est rendue. 2880 = 2 jours."),
-    "rob_enabled": ("games", "Vol entre membres (/rob)", "bool", 1, 0, 1,
-                    "Active ou coupe /rob (voler le portefeuille d'un autre membre). Tape /rob pour voir les règles."),
+    "rob_enabled": ("games", "Vol entre membres (/eco rob)", "bool", 1, 0, 1,
+                    "Active ou coupe /eco rob (voler le portefeuille d'un autre membre). Tape /eco rob pour voir les règles."),
     "rob_chance": ("games", "Chances de réussite du vol (%)", "int", 40, 1, 95,
                    "Probabilité qu'un vol réussisse. 40 = 4 chances sur 10. Plus c'est bas, plus voler est risqué."),
-    "rob_cd": ("games", "Délai du /rob (minutes)", "int", 120, 1, 1440,
+    "rob_cd": ("games", "Délai du /eco rob (minutes)", "int", 120, 1, 1440,
                "Temps à attendre entre deux vols."),
     "rob_min": ("games", "Minimum en portefeuille pour voler / être volé", "int", 200, 1, BIG,
                 "Il faut au moins ce montant dans son portefeuille pour voler, et la cible aussi pour être volée."),
@@ -122,7 +102,7 @@ SETTINGS = {
 }
 SECTIONS = {
     "general": ("⚙️", "Général", "Les règles de base : monnaie, argent de départ, boutique, revente."),
-    "gains": ("💰", "Gains", "Combien les membres gagnent et à quelle vitesse (/daily, /work, intérêts, discussion)."),
+    "gains": ("💰", "Gains", "Combien les membres gagnent : récompense quotidienne et gains en discutant."),
     "games": ("🎲", "Jeux & vols", "Coinflip, machine à sous et vol : mises maximales, chances et délais."),
 }
 
@@ -153,6 +133,9 @@ CREATE TABLE IF NOT EXISTS transactions(
     delta INTEGER, reason TEXT, ts REAL);
 CREATE TABLE IF NOT EXISTS settings(
     guild_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (guild_id, key));
+CREATE TABLE IF NOT EXISTS purchases(
+    guild_id INTEGER, user_id INTEGER, item_id INTEGER, qty INTEGER NOT NULL,
+    PRIMARY KEY (guild_id, user_id, item_id));
 CREATE TABLE IF NOT EXISTS coinflips(
     id INTEGER PRIMARY KEY AUTOINCREMENT, guild_id INTEGER NOT NULL, creator_id INTEGER NOT NULL,
     amount INTEGER NOT NULL, side TEXT NOT NULL, created REAL NOT NULL,
@@ -207,10 +190,6 @@ def dur_text(minutes: int) -> str:
     return " ".join(parts)
 
 
-def job_for(work_count: int):
-    return [j for j in JOBS if work_count >= j[0]][-1]
-
-
 def rarity_emoji(r: str) -> str:
     return RARITIES.get(r, RARITIES["commun"])[0]
 
@@ -233,8 +212,32 @@ def item_field(r, money: Callable[[int], str]):
     elif r["kind"] == "role":
         lines.append(f"🏷️ Donne le rôle <@&{r['role_id']}>")
     if r["max_per_user"]:
-        lines.append(f"🔒 Limite : {r['max_per_user']} par membre")
+        lines.append(f"🔒 Limité à {r['max_per_user']} achat(s) par membre")
     return f"{rarity_emoji(r['rarity'])} {r['name']}", "\n".join(lines)
+
+
+def fr(x: float, nd: int = 1) -> str:
+    return f"{x:.{nd}f}".replace(".", ",")
+
+
+def slots_stats():
+    """Probabilités exactes de la machine à sous (3 rouleaux indépendants, tirage pondéré)."""
+    total = sum(SLOT_WEIGHTS)
+    p = [w / total for w in SLOT_WEIGHTS]
+    triples = [(sym, pi ** 3, SLOT_TRIPLE[sym]) for sym, pi in zip(SLOT_SYMBOLS, p)]
+    p_pair = sum(3 * pi ** 2 * (1 - pi) for pi in p)
+    p_none = 1 - sum(t[1] for t in triples) - p_pair
+    rtp = sum(pt * mult for _, pt, mult in triples) + p_pair * SLOT_PAIR
+    return triples, p_pair, p_none, rtp
+
+
+def slots_odds_text() -> str:
+    triples, p_pair, p_none, rtp = slots_stats()
+    lines = [f"{sym * 3} → **×{mult}** · 1 chance sur {num(round(1 / pt))}" for sym, pt, mult in triples]
+    lines.append(f"Deux symboles identiques → **×{fr(SLOT_PAIR)}** · environ {round(p_pair * 100)} parties sur 100")
+    lines.append(f"Aucun symbole identique → mise perdue · environ {round(p_none * 100)} parties sur 100")
+    lines.append(f"**Retour moyen : {fr(rtp * 100)} %** : sur 1 000 misés, tu récupères en moyenne {round(rtp * 1000)}.")
+    return "\n".join(lines)
 
 
 # ───────────────────────── Base de données ─────────────────────────
@@ -314,6 +317,16 @@ class Store:
             "SELECT bonus, expires FROM boosts WHERE guild_id=? AND user_id=0 AND expires>? ORDER BY expires",
             (g, time.time())).fetchall()
 
+    def bought(self, g, u, item_id) -> int:
+        r = self.db.execute(
+            "SELECT qty FROM purchases WHERE guild_id=? AND user_id=? AND item_id=?", (g, u, item_id)).fetchone()
+        return r[0] if r else 0
+
+    def record_purchase(self, g, u, item_id, qty):
+        self.db.execute(
+            "INSERT INTO purchases(guild_id,user_id,item_id,qty) VALUES(?,?,?,?) "
+            "ON CONFLICT(guild_id,user_id,item_id) DO UPDATE SET qty=qty+excluded.qty", (g, u, item_id, qty))
+
     def find_item(self, g, name):
         return self.db.execute(
             "SELECT * FROM items WHERE guild_id=? AND name=? COLLATE NOCASE", (g, name.strip())).fetchone()
@@ -338,7 +351,7 @@ class Store:
         return cur.rowcount > 0
 
 
-# ───────────────────────── Boutique des membres (/shop) ─────────────────────────
+# ───────────────────────── Boutique des membres (/eco shop) ─────────────────────────
 class ShopView(discord.ui.View):
     PER_PAGE = 5
 
@@ -350,7 +363,7 @@ class ShopView(discord.ui.View):
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.origin.user.id:
-            await interaction.response.send_message("Ouvre ta propre boutique avec `/shop` 😉", ephemeral=True)
+            await interaction.response.send_message("Ouvre ta propre boutique avec `/eco shop` 😉", ephemeral=True)
             return False
         return True
 
@@ -440,7 +453,7 @@ class ShopView(discord.ui.View):
     async def on_buy(self, interaction: discord.Interaction):
         if not self.cog.store.cfg(self.g, "shop_open"):
             return await interaction.response.send_message("🔒 La boutique est fermée.", ephemeral=True)
-        ok, msg = self.cog.purchase(self.g, interaction.user.id, int(interaction.data["values"][0]), 1)
+        ok, msg = await self.cog.buy_item(interaction.user, int(interaction.data["values"][0]), 1)
         await interaction.response.send_message(msg, ephemeral=True)
         self.rebuild()
         try:
@@ -490,8 +503,8 @@ class ErrorModal(discord.ui.Modal):
 def help_embed() -> discord.Embed:
     e = discord.Embed(title="❓ Aide : à quoi sert chaque section ?", color=0x5865F2)
     e.add_field(name="⚙️ Général", value="Les règles de base : nom de la monnaie, argent de départ, boutique ouverte ou fermée, prix de revente.", inline=False)
-    e.add_field(name="💰 Gains", value="Combien les membres gagnent : récompense quotidienne /daily, travail /work, intérêts de la banque, gains en discutant.", inline=False)
-    e.add_field(name="🎲 Jeux & vols", value="Les jeux d'argent : mises maximales, durée des paris coinflip, et les chances du vol /rob.", inline=False)
+    e.add_field(name="💰 Gains", value="Combien les membres gagnent : récompense quotidienne /eco daily et petits gains en discutant.", inline=False)
+    e.add_field(name="🎲 Jeux & vols", value="Les jeux d'argent : mises maximales, durée des paris coinflip, chances du vol. Cette section affiche aussi les gains et probabilités de la machine à sous.", inline=False)
     e.add_field(name="🛍️ Boutique", value="Créer, modifier et supprimer les objets que les membres peuvent acheter, gérer leur stock, ouvrir ou fermer la boutique.", inline=False)
     e.add_field(name="👥 Membres", value="Donner ou retirer de l'argent à un membre précis, ou remettre son économie à zéro.", inline=False)
     e.add_field(name="🎉 Événements", value="Lancer un bonus de gains temporaire pour tout le serveur (ex. +50 % pendant 1 heure).", inline=False)
@@ -626,6 +639,16 @@ class SettingsPanel(AdminView):
                  for k in self.keys]
         e = discord.Embed(title=f"{icon} Réglages : {name}", color=0x5865F2,
                           description=f"{intro}\n\n" + "\n\n".join(lines))
+        if self.section == "games":
+            chance = self.cog.store.cfg(self.g, "rob_chance")
+            e.add_field(name="🎰 Machine à sous : gains et probabilités (fixes)", value=slots_odds_text(), inline=False)
+            e.add_field(name="🪙 Coinflip",
+                        value="Pari entre deux membres, 50 % / 50 %, sans commission : le gagnant empoche les deux mises.",
+                        inline=False)
+            e.add_field(name="🦹 Vol",
+                        value=(f"Réussite : **{chance} %** → on vole {ROB_STEAL[0]} à {ROB_STEAL[1]} % du portefeuille de la cible. "
+                               f"Échec : amende de {ROB_FINE[0]} à {ROB_FINE[1]} % du portefeuille du voleur. "
+                               "Ces deux fourchettes sont fixes. Détails : /eco rob."), inline=False)
         e.set_footer(text="Choisis un réglage dans le menu pour le modifier (les interrupteurs changent tout de suite).")
         return e
 
@@ -709,7 +732,7 @@ class ItemDetailModal(ErrorModal):
             self.dur_in = discord.ui.TextInput(label="Durée du boost (minutes)", default=str(d["duration"] // 60),
                                                max_length=6)
             self.add_item(self.dur_in)
-        self.limit_in = discord.ui.TextInput(label="Limite par membre (0 = aucune)", default=str(d["max_per_user"]),
+        self.limit_in = discord.ui.TextInput(label="Achats max par membre (0 = aucune)", default=str(d["max_per_user"]),
                                              max_length=6)
         self.add_item(self.limit_in)
 
@@ -844,6 +867,7 @@ class ShopPanel(AdminView):
         def action():
             db = self.cog.store.db
             db.execute("DELETE FROM inventory WHERE item_id=?", (r["id"],))
+            db.execute("DELETE FROM purchases WHERE item_id=?", (r["id"],))
             db.execute("DELETE FROM items WHERE id=?", (r["id"],))
             db.commit()
             return f"🗑️ **{r['name']}** supprimé (et retiré des inventaires)."
@@ -935,7 +959,7 @@ class ItemEditorView(AdminView):
         e.add_field(name="À quoi sert ce type ?", value=KIND_HELP[d["kind"]], inline=False)
         e.add_field(name="Les boutons",
                     value=("📝 **Infos** : nom, prix, description, catégorie, stock\n"
-                           "🔧 **Détails** : valeur du boost ou du coffre, durée, limite par membre\n"
+                           "🔧 **Détails** : valeur du boost ou du coffre, durée, nombre d'achats max par membre\n"
                            "💾 **Enregistrer** : ajoute l'objet à la boutique"), inline=False)
         problem = self.problem()
         e.set_footer(text=("⚠️ " + problem) if problem else "Tout est prêt : clique sur Enregistrer.")
@@ -1182,6 +1206,8 @@ class CoinflipButtons(discord.ui.View):
 
 # ───────────────────────── Cog ─────────────────────────
 class Economie(commands.Cog):
+    eco = app_commands.Group(name="eco", description="Économie et boutique du serveur", guild_only=True)
+
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.store = Store(DB_PATH)
@@ -1261,6 +1287,7 @@ class Economie(commands.Cog):
         return amount
 
     def purchase(self, g, u, item_id, qty):
+        """Achat (argent, stock, effet immédiat). Le rôle éventuel est donné par buy_item. Retourne (ok, message)."""
         s = self.store
         if not s.cfg(g, "shop_open"):
             return False, "🔒 La boutique est fermée."
@@ -1271,8 +1298,11 @@ class Economie(commands.Cog):
             return False, f"❌ **{it['name']}** est épuisé."
         if it["stock"] != -1 and it["stock"] < qty:
             return False, f"❌ Il ne reste que {it['stock']} exemplaire(s)."
-        if it["max_per_user"] and s.qty(g, u, item_id) + qty > it["max_per_user"]:
-            return False, f"❌ Tu ne peux pas en posséder plus de {it['max_per_user']}."
+        if it["max_per_user"]:
+            left = max(0, it["max_per_user"] - s.bought(g, u, item_id))
+            if left < qty:
+                return False, (f"❌ Limite par membre : tu ne peux plus en acheter que {left}." if left
+                               else "❌ Tu as atteint la limite d'achats pour cet objet.")
         cost = it["price"] * qty
         wallet = s.user(g, u)["wallet"]
         if wallet < cost:
@@ -1280,9 +1310,55 @@ class Economie(commands.Cog):
         s.add(g, u, wallet=-cost, reason=f"Achat {qty}× {it['name']}")
         if it["stock"] != -1:
             s.db.execute("UPDATE items SET stock=stock-? WHERE id=?", (qty, item_id))
-        s.give_item(g, u, item_id, qty)
+        s.record_purchase(g, u, item_id, qty)
+        extra, kind = "", it["kind"]
+        if kind == "collection":
+            s.give_item(g, u, item_id, qty)
+            extra = "Il est dans ton inventaire (`/eco inventory`)."
+        elif kind == "boost":
+            for _ in range(qty):
+                s.db.execute("INSERT INTO boosts(guild_id,user_id,bonus,expires) VALUES(?,?,?,?)",
+                             (g, u, it["value"], time.time() + it["duration"]))
+            extra = f"⚡ Boost activé : +{it['value']} % de gains pendant {dur_text(it['duration'] // 60)}."
+        elif kind == "coffre":
+            reward = sum(random.randint(max(1, it["value"] // 4), max(1, it["value"])) for _ in range(qty))
+            s.add(g, u, wallet=reward, reason=f"Coffre {it['name']}")
+            extra = f"🎁 Tu ouvres le coffre et tu trouves **{self.m(g, reward)}** !"
         s.db.commit()
-        return True, f"✅ Tu as acheté {qty}× **{it['name']}** pour {self.m(g, cost)}."
+        return True, f"✅ Tu as acheté {qty}× **{it['name']}** pour {self.m(g, cost)}." + (f"\n{extra}" if extra else "")
+
+    def refund_purchase(self, g, u, it, qty):
+        s = self.store
+        s.add(g, u, wallet=it["price"] * qty, reason=f"Remboursement {it['name']}")
+        if it["stock"] != -1:
+            s.db.execute("UPDATE items SET stock=stock+? WHERE id=?", (qty, it["id"]))
+        s.db.execute("UPDATE purchases SET qty=MAX(0, qty-?) WHERE guild_id=? AND user_id=? AND item_id=?",
+                     (qty, g, u, it["id"]))
+        s.db.commit()
+
+    async def buy_item(self, member: discord.Member, item_id: int, qty: int):
+        """Achat complet : les effets (boost, coffre) sont immédiats, le rôle est donné ici. Retourne (ok, message)."""
+        g, u, s = member.guild.id, member.id, self.store
+        it = s.db.execute("SELECT * FROM items WHERE id=? AND guild_id=?", (item_id, g)).fetchone()
+        role = None
+        if it and it["kind"] == "role":
+            if qty != 1:
+                return False, "❌ Un rôle ne s'achète qu'une fois à la fois."
+            role = member.guild.get_role(it["role_id"])
+            if role is None:
+                return False, "❌ Le rôle lié à cet objet n'existe plus : préviens un administrateur."
+            if role in member.roles:
+                return False, "❌ Tu as déjà ce rôle."
+        ok, msg = self.purchase(g, u, item_id, qty)
+        if not ok or role is None:
+            return ok, msg
+        try:
+            await member.add_roles(role, reason=f"Achat boutique : {it['name']}")
+        except discord.HTTPException:
+            self.refund_purchase(g, u, it, qty)
+            return False, ("❌ Je ne peux pas donner ce rôle (vérifie mes permissions et la position de mon rôle). "
+                           "Tu n'as pas été débité.")
+        return True, msg + f"\n🏷️ Tu reçois le rôle {role.mention} !"
 
     # ---- gains passifs ----
     @commands.Cog.listener()
@@ -1304,20 +1380,18 @@ class Economie(commands.Cog):
         self.store.db.commit()
 
     # ================= ADMINISTRATION =================
-    @app_commands.command(name="ecoconfig", description="Panneau de configuration de l'économie et de la boutique")
-    @app_commands.guild_only()
-    async def ecoconfig(self, interaction: discord.Interaction):
+    @eco.command(name="config", description="Panneau de configuration de l'économie et de la boutique")
+    async def eco_config(self, interaction: discord.Interaction):
         if not await self.require_admin(interaction):
             return
         view = MainPanel(self, interaction)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
-    @app_commands.command(name="addmoney", description="Ajouter de l'argent à un membre")
+    @eco.command(name="addmoney", description="Ajouter de l'argent à un membre")
     @app_commands.describe(membre="Le membre", montant="Montant à ajouter (ex. 5000, 5,000 ou 5k)",
                            destination="Portefeuille (par défaut) ou banque")
     @app_commands.choices(destination=[app_commands.Choice(name="Portefeuille", value="wallet"),
                                        app_commands.Choice(name="Banque", value="bank")])
-    @app_commands.guild_only()
     async def addmoney(self, interaction: discord.Interaction, membre: discord.Member, montant: str,
                        destination: str = "wallet"):
         if not await self.require_admin(interaction):
@@ -1334,12 +1408,11 @@ class Economie(commands.Cog):
             f"✅ {self.m(g, applied)} ajoutés au {where} de {membre.mention}.", ephemeral=True)
         await self.log_event(interaction.guild, f"{interaction.user.mention} a ajouté **{self.m(g, applied)}** au {where} de {membre.mention}.")
 
-    @app_commands.command(name="removemoney", description="Retirer de l'argent à un membre")
+    @eco.command(name="removemoney", description="Retirer de l'argent à un membre")
     @app_commands.describe(membre="Le membre", montant="Montant à retirer (ex. 5000, 5,000 ou 5k)",
                            destination="Portefeuille (par défaut) ou banque")
     @app_commands.choices(destination=[app_commands.Choice(name="Portefeuille", value="wallet"),
                                        app_commands.Choice(name="Banque", value="bank")])
-    @app_commands.guild_only()
     async def removemoney(self, interaction: discord.Interaction, membre: discord.Member, montant: str,
                           destination: str = "wallet"):
         if not await self.require_admin(interaction):
@@ -1357,8 +1430,7 @@ class Economie(commands.Cog):
         await self.log_event(interaction.guild, f"{interaction.user.mention} a retiré **{self.m(g, applied)}** du {where} de {membre.mention}.")
 
     # ================= ÉCONOMIE =================
-    @app_commands.command(name="balance", description="Voir ton solde (ou celui d'un membre)")
-    @app_commands.guild_only()
+    @eco.command(name="balance", description="Voir ton solde (ou celui d'un membre)")
     async def balance(self, interaction: discord.Interaction, membre: Optional[discord.Member] = None):
         membre = membre or interaction.user
         g = interaction.guild_id
@@ -1373,15 +1445,13 @@ class Economie(commands.Cog):
         e.add_field(name="Banque", value=self.m(g, r["bank"]))
         e.add_field(name="Total", value=self.m(g, total))
         e.add_field(name="Classement", value=f"#{rank}")
-        e.add_field(name="Métier", value=job_for(r["work_count"])[1])
-        e.add_field(name="Série /daily", value=f"{r['streak']} jour(s)")
+        e.add_field(name="Série /eco daily", value=f"{r['streak']} jour(s)")
         if bonus:
             e.add_field(name="⚡ Bonus de gains actif", value=f"+{bonus} %", inline=False)
         e.set_thumbnail(url=membre.display_avatar.url)
         await interaction.response.send_message(embed=e)
 
-    @app_commands.command(name="daily", description="Récupérer ta récompense quotidienne")
-    @app_commands.guild_only()
+    @eco.command(name="daily", description="Récupérer ta récompense quotidienne")
     async def daily(self, interaction: discord.Interaction):
         g, u, now, cfg = interaction.guild_id, interaction.user.id, time.time(), self.store.cfg
         cd = cfg(g, "daily_cd") * 3600
@@ -1393,45 +1463,17 @@ class Economie(commands.Cog):
         streak = r["streak"] + 1 if r["last_daily"] and now - r["last_daily"] <= 2 * cd else 1
         base = cfg(g, "daily_base") + cfg(g, "daily_step") * min(streak - 1, 30)
         gain, bonus = self.store.boosted(g, u, base)
-        interest = min(r["bank"] * cfg(g, "interest_pct") // 100, cfg(g, "interest_max"))
-        self.store.add(g, u, wallet=gain, bank=interest, reason="Récompense quotidienne")
+        self.store.add(g, u, wallet=gain, reason="Récompense quotidienne")
         self.store.db.execute("UPDATE users SET last_daily=?, streak=? WHERE guild_id=? AND user_id=?",
                               (now, streak, g, u))
         self.store.db.commit()
         e = discord.Embed(title="🎁 Récompense quotidienne", color=0x2ECC71,
                           description=f"Tu reçois **{self.m(g, gain)}**" + (f" (bonus +{bonus} %)" if bonus else ""))
         e.add_field(name="Série", value=f"🔥 {streak} jour(s) d'affilée")
-        if interest:
-            e.add_field(name="Intérêts bancaires", value=self.m(g, interest))
         await interaction.response.send_message(embed=e)
 
-    @app_commands.command(name="work", description="Travailler pour gagner de l'argent")
-    @app_commands.guild_only()
-    async def work(self, interaction: discord.Interaction):
-        g, u, now, cfg = interaction.guild_id, interaction.user.id, time.time(), self.store.cfg
-        r = self.store.user(g, u)
-        ready = r["last_work"] + cfg(g, "work_cd") * 60
-        if ready > now:
-            return await interaction.response.send_message(
-                f"⏳ Tu es fatigué ! Retour au travail <t:{int(ready)}:R>.", ephemeral=True)
-        count = r["work_count"] + 1
-        old, job = job_for(r["work_count"]), job_for(count)
-        base = random.randint(job[2], job[3]) * cfg(g, "work_mult") // 100
-        gain, bonus = self.store.boosted(g, u, base)
-        self.store.add(g, u, wallet=gain, reason=f"Travail ({job[1]})")
-        self.store.db.execute("UPDATE users SET last_work=?, work_count=? WHERE guild_id=? AND user_id=?",
-                              (now, count, g, u))
-        self.store.db.commit()
-        txt = f"{random.choice(WORK_TEXTS)} en tant que **{job[1]}** : **+{self.m(g, gain)}**"
-        if bonus:
-            txt += f" (bonus +{bonus} %)"
-        if job != old:
-            txt += f"\n🎉 Promotion ! Tu es maintenant **{job[1]}**."
-        await interaction.response.send_message(embed=discord.Embed(description=txt, color=0x3498DB))
-
-    @app_commands.command(name="deposit", description="Mettre de l'argent à la banque (à l'abri des vols)")
+    @eco.command(name="deposit", description="Mettre de l'argent à la banque (à l'abri des vols)")
     @app_commands.describe(montant="Un nombre, « tout », « moitié » ou un pourcentage (ex. 25%)")
-    @app_commands.guild_only()
     async def deposit(self, interaction: discord.Interaction, montant: str):
         g, u = interaction.guild_id, interaction.user.id
         wallet = self.store.user(g, u)["wallet"]
@@ -1442,9 +1484,8 @@ class Economie(commands.Cog):
         self.store.db.commit()
         await interaction.response.send_message(f"🏦 Tu as déposé **{self.m(g, amount)}** à la banque.")
 
-    @app_commands.command(name="withdraw", description="Retirer de l'argent de la banque")
+    @eco.command(name="withdraw", description="Retirer de l'argent de la banque")
     @app_commands.describe(montant="Un nombre, « tout », « moitié » ou un pourcentage (ex. 25%)")
-    @app_commands.guild_only()
     async def withdraw(self, interaction: discord.Interaction, montant: str):
         g, u = interaction.guild_id, interaction.user.id
         bank = self.store.user(g, u)["bank"]
@@ -1455,9 +1496,8 @@ class Economie(commands.Cog):
         self.store.db.commit()
         await interaction.response.send_message(f"🏦 Tu as retiré **{self.m(g, amount)}** de la banque.")
 
-    @app_commands.command(name="pay", description="Envoyer de l'argent à un membre")
+    @eco.command(name="pay", description="Envoyer de l'argent à un membre")
     @app_commands.describe(membre="Le destinataire", montant="Montant (ex. 500, 1,000, 1k, moitié ou tout)")
-    @app_commands.guild_only()
     async def pay(self, interaction: discord.Interaction, membre: discord.Member, montant: str):
         g, u = interaction.guild_id, interaction.user.id
         if membre.bot or membre.id == u:
@@ -1496,7 +1536,7 @@ class Economie(commands.Cog):
                           f"versée à ta cible (≈ {fine:g} % en moyenne).", inline=False)
         e.add_field(name="🛡️ Se protéger",
                     value="La banque est intouchable : seul le portefeuille peut être volé. "
-                          "Utilise `/deposit` pour mettre ton argent à l'abri.", inline=False)
+                          "Utilise `/eco deposit` pour mettre ton argent à l'abri.", inline=False)
         e.add_field(name="⏳ Conditions",
                     value=f"Un vol toutes les **{cd_txt}** · toi et ta cible devez avoir au moins "
                           f"**{self.m(g, cfg(g, 'rob_min'))}** en portefeuille.", inline=False)
@@ -1505,12 +1545,11 @@ class Economie(commands.Cog):
                            f"• Cible {self.m(g, 2000)} / toi {self.m(g, 1000)} : **{round(ev(2000, 1000)):+d}** par essai en moyenne\n"
                            f"• Cible {self.m(g, 1000)} / toi {self.m(g, 1000)} : **{round(ev(1000, 1000)):+d}** par essai en moyenne"),
                     inline=False)
-        e.set_footer(text="Tente ta chance avec /rob @membre")
+        e.set_footer(text="Tente ta chance avec /eco rob @membre")
         return e
 
-    @app_commands.command(name="rob", description="Voler le portefeuille d'un membre (sans cible : règles et probabilités)")
+    @eco.command(name="rob", description="Voler le portefeuille d'un membre (sans cible : règles et probabilités)")
     @app_commands.describe(membre="La cible du vol (laisse vide pour voir les règles et les probabilités)")
-    @app_commands.guild_only()
     async def rob(self, interaction: discord.Interaction, membre: Optional[discord.Member] = None):
         g, u, now, cfg = interaction.guild_id, interaction.user.id, time.time(), self.store.cfg
         if membre is None:
@@ -1550,7 +1589,7 @@ class Economie(commands.Cog):
             color = 0xE74C3C
         self.store.db.commit()
         e = discord.Embed(description=msg, color=color)
-        e.set_footer(text=f"Chances de réussite : {chance} % · /rob sans cible = règles détaillées")
+        e.set_footer(text=f"Chances de réussite : {chance} % · /eco rob sans cible = règles détaillées")
         await interaction.response.send_message(embed=e)
 
     def _bet(self, g, u, raw: str):
@@ -1732,11 +1771,10 @@ class Economie(commands.Cog):
             allowed_mentions=discord.AllowedMentions(
                 users=[discord.Object(id=res["creator"]), discord.Object(id=res["joiner"])]))
 
-    @app_commands.command(name="coinflip", description="Parier pile ou face contre un membre (sans option : voir les paris disponibles)")
+    @eco.command(name="coinflip", description="Parier pile ou face contre un membre (sans option : voir les paris disponibles)")
     @app_commands.describe(mise="Ta mise (ex. 500, 1,000, 1k ou tout)", choix="Ton côté de la pièce")
     @app_commands.choices(choix=[app_commands.Choice(name="Pile", value="pile"),
                                  app_commands.Choice(name="Face", value="face")])
-    @app_commands.guild_only()
     async def coinflip(self, interaction: discord.Interaction, mise: Optional[str] = None, choix: Optional[str] = None):
         g, u = interaction.guild_id, interaction.user.id
         if not self.store.cfg(g, "games_enabled"):
@@ -1754,7 +1792,7 @@ class Economie(commands.Cog):
             e = discord.Embed(title="🪙 Coinflips disponibles", color=0xF1C40F,
                               description="\n".join(lines) or "Aucun pari disponible pour le moment.")
             e.add_field(name="Comment ça marche ?", value=(
-                "• **Créer un pari** : `/coinflip mise:500 choix:pile`. Il est posté dans le salon avec un bouton **Participer**.\n"
+                "• **Créer un pari** : `/eco coinflip mise:500 choix:pile`. Il est posté dans le salon avec un bouton **Participer**.\n"
                 "• **Relever un pari** : clique sur **Participer** sous son message (il faut avoir la mise dans ton portefeuille). "
                 "Tu prends l'autre côté de la pièce.\n"
                 f"• Le gagnant empoche les deux mises, le perdant perd la sienne. Un pari que personne ne relève expire après "
@@ -1764,7 +1802,7 @@ class Economie(commands.Cog):
         if mise is None or choix is None:
             return await interaction.response.send_message(
                 "❌ Pour créer un pari, indique la `mise` **et** le `choix` (pile ou face). "
-                "Sans option, `/coinflip` affiche les paris disponibles.", ephemeral=True)
+                "Sans option, `/eco coinflip` affiche les paris disponibles.", ephemeral=True)
         res, err = self.create_coinflip(g, u, choix, mise)
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
@@ -1783,33 +1821,42 @@ class Economie(commands.Cog):
         self.store.db.commit()
         await interaction.followup.send(f"✅ Ton pari est en ligne : {msg.jump_url}", ephemeral=True)
 
-    @app_commands.command(name="slots", description="Machine à sous")
-    @app_commands.describe(mise="Un nombre, « tout », « moitié » ou un pourcentage")
-    @app_commands.guild_only()
-    async def slots(self, interaction: discord.Interaction, mise: str):
+    @eco.command(name="slots", description="Machine à sous (sans mise : voir les gains et les probabilités)")
+    @app_commands.describe(mise="Ta mise (ex. 500, 1,000, 1k, moitié ou tout). Laisse vide pour voir les probabilités.")
+    async def slots(self, interaction: discord.Interaction, mise: Optional[str] = None):
         g, u = interaction.guild_id, interaction.user.id
+        if mise is None:
+            e = discord.Embed(
+                title="🎰 Machine à sous : gains et probabilités", color=0x9B59B6,
+                description=("Trois symboles sont tirés au hasard. **Tu gagnes dès que deux symboles sont identiques.**\n\n"
+                             + slots_odds_text()))
+            e.set_footer(text=f"Mise max : {self.m(g, self.store.cfg(g, 'max_bet'))} · Pour jouer : /eco slots mise:500")
+            return await interaction.response.send_message(embed=e, ephemeral=True)
         bet, err = self._bet(g, u, mise)
         if err:
             return await interaction.response.send_message(err, ephemeral=True)
         reels = random.choices(SLOT_SYMBOLS, SLOT_WEIGHTS, k=3)
         if len(set(reels)) == 1:
-            mult, label = SLOT_TRIPLE[reels[0]], "JACKPOT !"
+            mult, label = SLOT_TRIPLE[reels[0]], "🎉 JACKPOT ! Trois symboles identiques"
         elif len(set(reels)) == 2:
-            mult, label = 1.5, "Deux identiques !"
+            mult, label = SLOT_PAIR, "Deux symboles identiques"
         else:
-            mult, label = 0, "Perdu…"
+            mult, label = 0, "Aucun symbole identique : perdu"
         payout = int(bet * mult)
         net = payout - bet
         self.store.add(g, u, wallet=net, reason="Machine à sous")
         self.store.db.commit()
-        result = (f"Gain net : **+{self.m(g, net)}**" if net > 0
-                  else f"Perte : **{self.m(g, -net)}**" if net < 0 else "Mise remboursée.")
-        await interaction.response.send_message(embed=discord.Embed(
-            title="🎰 Machine à sous", color=0x2ECC71 if net > 0 else 0xE74C3C,
-            description=f"**{'  |  '.join(reels)}**\n\n{label}\n{result}"))
+        outcome = (f"**+{self.m(g, net)}**" if net > 0 else f"**-{self.m(g, -net)}**" if net < 0
+                   else "Mise remboursée")
+        e = discord.Embed(title="🎰 Machine à sous", color=0x2ECC71 if net > 0 else 0xE74C3C,
+                          description=f"**{'  |  '.join(reels)}**\n\n{label}")
+        e.add_field(name="Mise", value=self.m(g, bet))
+        e.add_field(name="Multiplicateur", value=f"×{fr(mult)}" if mult % 1 else f"×{int(mult)}")
+        e.add_field(name="Résultat", value=outcome)
+        e.set_footer(text="Gains et probabilités : /eco slots (sans mise)")
+        await interaction.response.send_message(embed=e)
 
-    @app_commands.command(name="baltop", description="Classement des membres les plus riches")
-    @app_commands.guild_only()
+    @eco.command(name="baltop", description="Classement des membres les plus riches")
     async def baltop(self, interaction: discord.Interaction):
         g = interaction.guild_id
         rows = self.store.db.execute(
@@ -1821,28 +1868,52 @@ class Economie(commands.Cog):
         await interaction.response.send_message(embed=discord.Embed(
             title="🏆 Les plus riches", description="\n".join(lines) or "Personne pour l'instant.", color=0xF1C40F))
 
+    @eco.command(name="aide", description="Comment fonctionne l'économie : toutes les commandes expliquées")
+    async def aide(self, interaction: discord.Interaction):
+        g, c = interaction.guild_id, self.store.cfg
+        gains = f"• `/eco daily` : récompense toutes les {c(g, 'daily_cd')} h ; plus tu enchaînes les jours, plus elle grossit."
+        if c(g, "msg_enabled"):
+            gains += f"\n• Écrire dans le serveur rapporte un petit gain (au plus une fois toutes les {c(g, 'msg_cd')} s)."
+        e = discord.Embed(
+            title="📖 Aide de l'économie", color=0x5865F2,
+            description=f"La monnaie du serveur : **{c(g, 'currency')}**. Toutes les commandes commencent par `/eco`.")
+        e.add_field(name="💰 Gagner de l'argent", value=gains, inline=False)
+        e.add_field(name="🏦 Ton argent", value=(
+            "• `/eco balance` : ton solde\n"
+            "• `/eco deposit` et `/eco withdraw` : mettre de l'argent à l'abri à la banque (elle ne peut pas être volée) ou le reprendre\n"
+            "• `/eco pay` : envoyer de l'argent à un membre\n"
+            "• `/eco baltop` : le classement des plus riches"), inline=False)
+        e.add_field(name="🎲 Jeux", value=(
+            f"• `/eco coinflip` : pari pile ou face contre un membre (mise max {self.m(g, c(g, 'coinflip_max'))})\n"
+            "• `/eco slots` : machine à sous (sans mise : gains et probabilités)\n"
+            "• `/eco rob` : voler un membre (sans cible : règles et probabilités)"), inline=False)
+        e.add_field(name="🛍️ Boutique", value=(
+            "• `/eco shop` : voir les objets et les acheter. L'effet est immédiat (rôle, boost, coffre).\n"
+            "• `/eco buy` : acheter un objet par son nom\n"
+            "• `/eco inventory` : tes objets de collection\n"
+            "• `/eco sell` : revendre un objet"), inline=False)
+        e.set_footer(text="Les montants acceptent 5000, 5,000, 5k, « moitié » ou « tout ».")
+        await interaction.response.send_message(embed=e, ephemeral=True)
+
     # ================= BOUTIQUE =================
-    @app_commands.command(name="shop", description="Ouvrir la boutique")
+    @eco.command(name="shop", description="Ouvrir la boutique")
     @app_commands.describe(categorie="Filtrer sur une catégorie")
-    @app_commands.guild_only()
     async def shop(self, interaction: discord.Interaction, categorie: Optional[str] = None):
         if not self.store.cfg(interaction.guild_id, "shop_open"):
             return await interaction.response.send_message("🔒 La boutique est fermée pour le moment.", ephemeral=True)
         view = ShopView(self, interaction, categorie)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
-    @app_commands.command(name="buy", description="Acheter un objet de la boutique")
-    @app_commands.guild_only()
+    @eco.command(name="buy", description="Acheter un objet de la boutique (l'effet est immédiat)")
     async def buy(self, interaction: discord.Interaction, objet: str,
                   quantite: app_commands.Range[int, 1, 100] = 1):
         it = self.store.find_item(interaction.guild_id, objet)
         if not it:
             return await interaction.response.send_message("❌ Objet introuvable.", ephemeral=True)
-        ok, msg = self.purchase(interaction.guild_id, interaction.user.id, it["id"], quantite)
+        ok, msg = await self.buy_item(interaction.user, it["id"], quantite)
         await interaction.response.send_message(msg, ephemeral=not ok)
 
-    @app_commands.command(name="inventory", description="Voir ton inventaire (ou celui d'un membre)")
-    @app_commands.guild_only()
+    @eco.command(name="inventory", description="Voir ton inventaire (ou celui d'un membre)")
     async def inventory(self, interaction: discord.Interaction, membre: Optional[discord.Member] = None):
         membre = membre or interaction.user
         rows = self.store.db.execute(
@@ -1854,52 +1925,7 @@ class Economie(commands.Cog):
             title=f"🎒 Inventaire de {membre.display_name}",
             description="\n".join(lines)[:4000] or "Vide pour l'instant.", color=0x9B59B6))
 
-    @app_commands.command(name="use", description="Utiliser un objet de ton inventaire")
-    @app_commands.guild_only()
-    async def use(self, interaction: discord.Interaction, objet: str):
-        g, u = interaction.guild_id, interaction.user.id
-        it = self.store.find_item(g, objet)
-        if not it or self.store.qty(g, u, it["id"]) < 1:
-            return await interaction.response.send_message("❌ Tu n'as pas cet objet.", ephemeral=True)
-        kind = it["kind"]
-        if kind == "collection":
-            return await interaction.response.send_message(
-                f"🖼️ **{it['name']}** est un objet de collection, il n'a pas d'effet.", ephemeral=True)
-        if kind == "role":
-            role = interaction.guild.get_role(it["role_id"])
-            if not role:
-                return await interaction.response.send_message("❌ Le rôle associé n'existe plus.", ephemeral=True)
-            if role in interaction.user.roles:
-                return await interaction.response.send_message("❌ Tu as déjà ce rôle.", ephemeral=True)
-            self.store.take_item(g, u, it["id"], 1)
-            self.store.db.commit()
-            try:
-                await interaction.user.add_roles(role, reason=f"Objet de boutique : {it['name']}")
-            except discord.HTTPException:
-                self.store.give_item(g, u, it["id"], 1)   # remboursement de l'objet
-                self.store.db.commit()
-                return await interaction.response.send_message(
-                    "❌ Je ne peux pas donner ce rôle (vérifie mes permissions et la position de mon rôle). "
-                    "Objet conservé.", ephemeral=True)
-            return await interaction.response.send_message(f"🏷️ Tu as reçu le rôle {role.mention} !")
-        if not self.store.take_item(g, u, it["id"], 1):
-            return await interaction.response.send_message("❌ Tu n'as pas cet objet.", ephemeral=True)
-        if kind == "boost":
-            self.store.db.execute("INSERT INTO boosts(guild_id,user_id,bonus,expires) VALUES(?,?,?,?)",
-                                  (g, u, it["value"], time.time() + it["duration"]))
-            self.store.db.commit()
-            return await interaction.response.send_message(
-                f"⚡ **{it['name']}** activé : +{it['value']} % de gains pendant {it['duration'] // 60} min !")
-        if kind == "coffre":
-            reward = random.randint(max(1, it["value"] // 4), max(1, it["value"]))
-            self.store.add(g, u, wallet=reward, reason=f"Coffre {it['name']}")
-            self.store.db.commit()
-            return await interaction.response.send_message(embed=discord.Embed(
-                title=f"🎁 {it['name']} ouvert !", description=f"Tu trouves **{self.m(g, reward)}** dedans.",
-                color=0xF1C40F))
-
-    @app_commands.command(name="sell", description="Revendre un objet")
-    @app_commands.guild_only()
+    @eco.command(name="sell", description="Revendre un objet")
     async def sell(self, interaction: discord.Interaction, objet: str,
                    quantite: app_commands.Range[int, 1, 100] = 1):
         g, u = interaction.guild_id, interaction.user.id
@@ -1921,7 +1947,6 @@ class Economie(commands.Cog):
             (interaction.guild_id, f"%{current}%")).fetchall()
         return [app_commands.Choice(name=r["name"][:100], value=r["name"]) for r in rows]
 
-    @use.autocomplete("objet")
     @sell.autocomplete("objet")
     async def ac_owned(self, interaction: discord.Interaction, current: str):
         rows = self.store.db.execute(
