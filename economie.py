@@ -3,12 +3,10 @@ economie.py : économie (cog discord.py 2.x + SQLite) avec panneau de configurat
 
 Chargement dans ton bot :  await bot.load_extension("economie")
 
-Administration (réservée à ECO_OWNER_ID, au propriétaire défini dans BOT.py et à la personne qui a invité le bot) :
-    /eco config       panneau complet : réglages, membres, événements, journal
-    /eco addmoney     ajouter de l'argent à un membre
-    /eco removemoney  retirer de l'argent à un membre
-
-Toutes les commandes de l'économie sont regroupées sous /eco (une seule entrée dans la liste de Discord).
+Une seule commande dans la liste de Discord : /eco. Elle ouvre un menu (boutons et fenêtres) avec toutes les
+actions : récompense quotidienne, banque, envoi d'argent, classement, coinflip, machine à sous, vol, aide.
+L'administration (réglages, membres, événements, journal) est un bouton du menu, réservé à ECO_OWNER_ID,
+au propriétaire défini dans BOT.py et à la personne qui a invité le bot.
 """
 import logging
 import os
@@ -50,12 +48,12 @@ SETTINGS = {
                      "Argent donné à un membre la toute première fois qu'il utilise l'économie."),
     "bonus_cap": ("general", "Bonus de gains maximum cumulé (%)", "int", 300, 0, 1000,
                   "Les événements de bonus s'additionnent : ce plafond limite le total. 300 = gains ×4 au maximum."),
-    "daily_base": ("gains", "Récompense /eco daily de base", "int", 250, 0, BIG,
-                   "Montant reçu avec /eco daily le premier jour de la série."),
-    "daily_step": ("gains", "Bonus de série /eco daily (par jour d'affilée)", "int", 25, 0, BIG,
+    "daily_base": ("gains", "Récompense quotidienne de base", "int", 250, 0, BIG,
+                   "Montant reçu avec la récompense quotidienne le premier jour de la série."),
+    "daily_step": ("gains", "Bonus de série quotidienne (par jour d'affilée)", "int", 25, 0, BIG,
                    "Montant ajouté pour chaque jour d'affilée (30 jours max). Ex. base 250 et bonus 25 : 275 le 2e jour."),
-    "daily_cd": ("gains", "Délai du /eco daily (heures)", "int", 24, 1, 720,
-                 "Temps à attendre entre deux /eco daily. Si un membre attend plus du double, sa série repart de zéro."),
+    "daily_cd": ("gains", "Délai de la récompense quotidienne (heures)", "int", 24, 1, 720,
+                 "Temps à attendre entre deux récompenses quotidiennes. Si un membre attend plus du double, sa série repart de zéro."),
     "msg_enabled": ("gains", "Gains en discutant", "bool", 1, 0, 1,
                     "Les membres gagnent un peu d'argent en écrivant des messages dans le serveur."),
     "msg_min": ("gains", "Gain minimum par message", "int", 1, 0, 1_000_000,
@@ -65,18 +63,18 @@ SETTINGS = {
     "msg_cd": ("gains", "Délai entre deux gains de message (s)", "int", 60, 5, 3600,
                "Anti-spam : un membre ne gagne qu'une fois par ce délai. 60 = 1 gain par minute au maximum."),
     "games_enabled": ("games", "Jeux d'argent (coinflip, machine à sous)", "bool", 1, 0, 1,
-                      "Active ou coupe /eco coinflip et /eco slots."),
+                      "Active ou coupe le coinflip et la machine à sous."),
     "max_bet": ("games", "Mise maximale de la machine à sous", "int", 100_000, 1, BIG,
-                "Plus grosse mise acceptée à /eco slots."),
+                "Plus grosse mise acceptée à la machine à sous."),
     "coinflip_max": ("games", "Mise maximale du coinflip", "int", 5000, 1, BIG,
-                     "Plus grosse mise acceptée pour un pari /eco coinflip entre membres."),
+                     "Plus grosse mise acceptée pour un pari coinflip entre membres."),
     "coinflip_ttl": ("games", "Durée de vie d'un pari coinflip (minutes)", "int", 2880, 1, 20160,
                      "Au bout de ce temps, un pari que personne n'a relevé expire et la mise est rendue. 2880 = 2 jours."),
-    "rob_enabled": ("games", "Vol entre membres (/eco rob)", "bool", 1, 0, 1,
-                    "Active ou coupe /eco rob (voler le portefeuille d'un autre membre). Tape /eco rob pour voir les règles."),
+    "rob_enabled": ("games", "Vol entre membres", "bool", 1, 0, 1,
+                    "Active ou coupe le vol (voler le portefeuille d'un autre membre). Les règles sont affichées dans le menu Voler."),
     "rob_chance": ("games", "Chances de réussite du vol (%)", "int", 40, 1, 95,
                    "Probabilité qu'un vol réussisse. 40 = 4 chances sur 10. Plus c'est bas, plus voler est risqué."),
-    "rob_cd": ("games", "Délai du /eco rob (minutes)", "int", 120, 1, 1440,
+    "rob_cd": ("games", "Délai entre deux vols (minutes)", "int", 120, 1, 1440,
                "Temps à attendre entre deux vols."),
     "rob_min": ("games", "Minimum en portefeuille pour voler / être volé", "int", 200, 1, BIG,
                 "Il faut au moins ce montant dans son portefeuille pour voler, et la cible aussi pour être volée."),
@@ -315,7 +313,7 @@ class ErrorModal(discord.ui.Modal):
 def help_embed() -> discord.Embed:
     e = discord.Embed(title="❓ Aide : à quoi sert chaque section ?", color=0x5865F2)
     e.add_field(name="⚙️ Général", value="Les règles de base : nom de la monnaie, argent de départ, plafond de bonus.", inline=False)
-    e.add_field(name="💰 Gains", value="Combien les membres gagnent : récompense quotidienne /eco daily et petits gains en discutant.", inline=False)
+    e.add_field(name="💰 Gains", value="Combien les membres gagnent : récompense quotidienne et petits gains en discutant.", inline=False)
     e.add_field(name="🎲 Jeux & vols", value="Les jeux d'argent : mises maximales, durée des paris coinflip, chances du vol. Cette section affiche aussi les gains et probabilités de la machine à sous.", inline=False)
     e.add_field(name="👥 Membres", value="Donner ou retirer de l'argent à un membre précis, ou remettre son économie à zéro.", inline=False)
     e.add_field(name="🎉 Événements", value="Lancer un bonus de gains temporaire pour tout le serveur (ex. +50 % pendant 1 heure).", inline=False)
@@ -377,6 +375,10 @@ class MainPanel(AdminView):
     @discord.ui.button(label="Aide", emoji="❓", style=discord.ButtonStyle.secondary, row=2)
     async def b_help(self, interaction, button):
         await interaction.response.send_message(embed=help_embed(), ephemeral=True)
+
+    @discord.ui.button(label="Menu /eco", emoji="🏠", style=discord.ButtonStyle.secondary, row=2)
+    async def b_home(self, interaction, button):
+        await self.go(interaction, EcoHub(self.cog, self.origin))
 
     @discord.ui.button(label="Fermer", emoji="✖️", style=discord.ButtonStyle.danger, row=2)
     async def b_close(self, interaction, button):
@@ -453,7 +455,7 @@ class SettingsPanel(AdminView):
             e.add_field(name="🦹 Vol",
                         value=(f"Réussite : **{chance} %** → on vole {ROB_STEAL[0]} à {ROB_STEAL[1]} % du portefeuille de la cible. "
                                f"Échec : amende de {ROB_FINE[0]} à {ROB_FINE[1]} % du portefeuille du voleur. "
-                               "Ces deux fourchettes sont fixes. Détails : /eco rob."), inline=False)
+                               "Ces deux fourchettes sont fixes. Détails dans le menu Voler."), inline=False)
         e.set_footer(text="Choisis un réglage dans le menu pour le modifier (les interrupteurs changent tout de suite).")
         return e
 
@@ -652,6 +654,333 @@ class LogPanel(AdminView):
         await self.go(interaction, MainPanel(self.cog, self.origin))
 
 
+# ---------- Menu /eco (pour tous les membres) ----------
+class EcoView(discord.ui.View):
+    """Base des écrans du menu /eco : réservé à la personne qui l'a ouvert."""
+
+    def __init__(self, cog, origin: discord.Interaction, timeout: float = 600):
+        super().__init__(timeout=timeout)
+        self.cog, self.origin = cog, origin
+        self.g, self.uid = origin.guild_id, origin.user.id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.origin.user.id:
+            await interaction.response.send_message("Ce menu n'est pas à toi : tape `/eco` pour ouvrir le tien.",
+                                                    ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        for c in self.children:
+            c.disabled = True
+        try:
+            await self.origin.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
+    async def go(self, interaction: discord.Interaction, view: "EcoView"):
+        self.stop()  # annule le délai de cet écran pour qu'il n'écrase pas le suivant
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    async def home(self, interaction: discord.Interaction, notice: Optional[str] = None):
+        await self.go(interaction, EcoHub(self.cog, self.origin, notice))
+
+    def embed(self) -> discord.Embed:  # pragma: no cover
+        raise NotImplementedError
+
+
+class AmountModal(ErrorModal):
+    """Fenêtre de saisie d'un montant (5000, 5,000, 5k, moitié, tout…)."""
+
+    def __init__(self, title: str, placeholder: str, on_value: Callable):
+        super().__init__(title=title[:45])
+        self.on_value = on_value
+        self.f_amount = discord.ui.TextInput(label="Montant (5000, 5k, moitié, tout…)",
+                                             placeholder=placeholder[:100], max_length=20)
+        self.add_item(self.f_amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.on_value(interaction, self.f_amount.value)
+
+
+class EcoHub(EcoView):
+    """Écran d'accueil du menu /eco : ton solde et toutes les actions."""
+
+    def __init__(self, cog, origin, notice: Optional[str] = None):
+        super().__init__(cog, origin)
+        self.notice = notice
+        if not cog.can_admin(self.uid, self.g):
+            self.remove_item(self.b_admin)
+
+    def embed(self):
+        s, g, m = self.cog.store, self.g, self.cog.m
+        r = s.user(g, self.uid)
+        total = r["wallet"] + r["bank"]
+        rank = s.db.execute("SELECT COUNT(*)+1 FROM users WHERE guild_id=? AND wallet+bank>?", (g, total)).fetchone()[0]
+        s.db.commit()
+        e = discord.Embed(title=f"💼 Économie : {self.origin.user.display_name}", color=0xF1C40F,
+                          description=self.notice or "Choisis une action avec les boutons ci-dessous.")
+        e.add_field(name="Portefeuille", value=m(g, r["wallet"]))
+        e.add_field(name="Banque", value=m(g, r["bank"]))
+        e.add_field(name="Total", value=f"{m(g, total)} · #{rank}")
+        events = s.events(g)
+        if events:
+            e.add_field(name="🎉 Événement en cours",
+                        value=f"+{events[0]['bonus']} % de gains jusqu'à <t:{int(events[0]['expires'])}:R>", inline=False)
+        e.set_footer(text=f"La banque est à l'abri des vols · Série quotidienne : {r['streak']} jour(s)")
+        return e
+
+    @discord.ui.button(label="Récompense quotidienne", emoji="🎁", style=discord.ButtonStyle.success, row=0)
+    async def b_daily(self, interaction, button):
+        await self.home(interaction, self.cog.claim_daily(self.g, self.uid))
+
+    @discord.ui.button(label="Classement", emoji="🏆", style=discord.ButtonStyle.secondary, row=0)
+    async def b_rank(self, interaction, button):
+        await self.go(interaction, TextScreen(self.cog, self.origin, self.cog.leaderboard_embed(self.g)))
+
+    @discord.ui.button(label="Actualiser", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def b_refresh(self, interaction, button):
+        await self.home(interaction)
+
+    @discord.ui.button(label="Déposer", emoji="🏦", style=discord.ButtonStyle.primary, row=1)
+    async def b_deposit(self, interaction, button):
+        async def done(inter, raw):
+            await self.home(inter, self.cog.bank_move(self.g, self.uid, raw, True))
+        wallet = self.cog.store.user(self.g, self.uid)["wallet"]
+        await interaction.response.send_modal(AmountModal("Déposer à la banque", f"Portefeuille : {num(wallet)}", done))
+
+    @discord.ui.button(label="Retirer", emoji="🏧", style=discord.ButtonStyle.primary, row=1)
+    async def b_withdraw(self, interaction, button):
+        async def done(inter, raw):
+            await self.home(inter, self.cog.bank_move(self.g, self.uid, raw, False))
+        bank = self.cog.store.user(self.g, self.uid)["bank"]
+        await interaction.response.send_modal(AmountModal("Retirer de la banque", f"Banque : {num(bank)}", done))
+
+    @discord.ui.button(label="Envoyer", emoji="💸", style=discord.ButtonStyle.primary, row=1)
+    async def b_pay(self, interaction, button):
+        await self.go(interaction, PayView(self.cog, self.origin))
+
+    @discord.ui.button(label="Coinflip", emoji="🪙", style=discord.ButtonStyle.success, row=2)
+    async def b_coinflip(self, interaction, button):
+        await self.go(interaction, CoinflipMenu(self.cog, self.origin))
+
+    @discord.ui.button(label="Machine à sous", emoji="🎰", style=discord.ButtonStyle.success, row=2)
+    async def b_slots(self, interaction, button):
+        await self.go(interaction, SlotsView(self.cog, self.origin))
+
+    @discord.ui.button(label="Voler", emoji="🦹", style=discord.ButtonStyle.danger, row=2)
+    async def b_rob(self, interaction, button):
+        await self.go(interaction, RobView(self.cog, self.origin))
+
+    @discord.ui.button(label="Aide", emoji="❓", style=discord.ButtonStyle.secondary, row=3)
+    async def b_help(self, interaction, button):
+        await self.go(interaction, TextScreen(self.cog, self.origin, self.cog.player_help_embed(self.g)))
+
+    @discord.ui.button(label="Administration", emoji="⚙️", style=discord.ButtonStyle.secondary, row=3)
+    async def b_admin(self, interaction, button):
+        await self.go(interaction, MainPanel(self.cog, self.origin))
+
+    @discord.ui.button(label="Fermer", emoji="✖️", style=discord.ButtonStyle.danger, row=3)
+    async def b_close(self, interaction, button):
+        self.stop()
+        await interaction.response.edit_message(content="Menu fermé. Tape `/eco` pour le rouvrir.", embed=None, view=None)
+
+
+class TextScreen(EcoView):
+    """Écran simple : un embed et un bouton Retour (classement, aide)."""
+
+    def __init__(self, cog, origin, embed: discord.Embed):
+        super().__init__(cog, origin)
+        self._embed = embed
+
+    def embed(self):
+        return self._embed
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary)
+    async def back(self, interaction, button):
+        await self.home(interaction)
+
+
+class PayView(EcoView):
+    def __init__(self, cog, origin):
+        super().__init__(cog, origin)
+        self.target = None
+        pick = discord.ui.UserSelect(placeholder="À qui envoyer de l'argent ?", min_values=1, max_values=1, row=0)
+
+        async def on_pick(interaction: discord.Interaction):
+            user = pick.values[0]
+            if user.bot or user.id == self.uid:
+                return await interaction.response.send_message(
+                    "⚠️ Choisis un autre membre (pas toi, pas un bot).", ephemeral=True)
+            self.target = user
+            self.send_btn.disabled = False
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+        pick.callback = on_pick
+        self.add_item(pick)
+
+    def embed(self):
+        wallet = self.cog.store.user(self.g, self.uid)["wallet"]
+        return discord.Embed(
+            title="💸 Envoyer de l'argent", color=0x3498DB,
+            description=(f"Destinataire : {self.target.mention}\nClique sur **Choisir le montant**."
+                         if self.target else "Choisis un destinataire dans le menu, puis clique sur **Choisir le montant**.")
+                        + f"\n\nTon portefeuille : {self.cog.m(self.g, wallet)}")
+
+    @discord.ui.button(label="Choisir le montant", emoji="💸", style=discord.ButtonStyle.success, row=1, disabled=True)
+    async def send_btn(self, interaction, button):
+        target = self.target
+
+        async def done(inter, raw):
+            ok, text, public = self.cog.do_pay(self.g, self.uid, target.id, raw)
+            if not ok:
+                return await inter.response.send_message(text, ephemeral=True)
+            await self.home(inter, text)
+            try:
+                await inter.channel.send(
+                    content=public, allowed_mentions=discord.AllowedMentions(users=[discord.Object(id=target.id)]))
+            except (discord.HTTPException, AttributeError):
+                pass
+        await interaction.response.send_modal(AmountModal("Envoyer de l'argent", "Ex. 500, 1,000, 1k, moitié…", done))
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await self.home(interaction)
+
+
+class CoinflipMenu(EcoView):
+    def __init__(self, cog, origin, notice: Optional[str] = None):
+        super().__init__(cog, origin)
+        self.notice = notice
+
+    def embed(self):
+        return self.cog.coinflip_menu_embed(self.g, self.uid, self.notice)
+
+    async def _create(self, interaction: discord.Interaction, side: str):
+        cog = self.cog
+        maxi = cog.store.cfg(self.g, "coinflip_max")
+
+        async def done(inter, raw):
+            res, err = cog.create_coinflip(self.g, self.uid, side, raw)
+            if err:
+                return await inter.response.send_message(err, ephemeral=True)
+            try:
+                msg = await inter.channel.send(
+                    embed=cog.coinflip_open_embed(self.g, inter.user, res), view=CoinflipButtons(cog),
+                    allowed_mentions=discord.AllowedMentions.none())
+            except (discord.HTTPException, AttributeError):
+                cog.cancel_coinflip(self.g, self.uid, res["id"])
+                return await inter.response.send_message(
+                    "❌ Je n'ai pas pu poster le pari dans ce salon (il me faut la permission d'envoyer des messages "
+                    "et des embeds). Ta mise t'a été rendue.", ephemeral=True)
+            cog.store.db.execute("UPDATE coinflips SET channel_id=?, message_id=? WHERE id=?",
+                                 (msg.channel.id, msg.id, res["id"]))
+            cog.store.db.commit()
+            await self.go(inter, CoinflipMenu(cog, self.origin, f"✅ Ton pari est en ligne : {msg.jump_url}"))
+        await interaction.response.send_modal(
+            AmountModal(f"Coinflip : tu prends {side}", f"Maximum : {num(maxi)}", done))
+
+    @discord.ui.button(label="Créer : pile", emoji="🪙", style=discord.ButtonStyle.success, row=0)
+    async def b_pile(self, interaction, button):
+        await self._create(interaction, "pile")
+
+    @discord.ui.button(label="Créer : face", emoji="🪙", style=discord.ButtonStyle.success, row=0)
+    async def b_face(self, interaction, button):
+        await self._create(interaction, "face")
+
+    @discord.ui.button(label="Actualiser", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
+    async def b_refresh(self, interaction, button):
+        await self.go(interaction, CoinflipMenu(self.cog, self.origin))
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await self.home(interaction)
+
+
+class SlotsView(EcoView):
+    def __init__(self, cog, origin, last: Optional[dict] = None):
+        super().__init__(cog, origin)
+        self.last = last
+        self.again_btn.disabled = last is None
+        if last:
+            self.again_btn.label = f"Rejouer {num(last['bet'])}"[:80]
+
+    def embed(self):
+        g, last = self.g, self.last
+        color = 0x9B59B6 if not last else 0x2ECC71 if last["net"] > 0 else 0xE74C3C if last["net"] < 0 else 0x95A5A6
+        e = discord.Embed(
+            title="🎰 Machine à sous", color=color,
+            description=last["text"] if last else
+            "Trois symboles sont tirés au hasard. **Tu gagnes dès que deux symboles sont identiques.**")
+        e.add_field(name="Gains et probabilités", value=slots_odds_text(), inline=False)
+        wallet = self.cog.store.user(g, self.uid)["wallet"]
+        e.set_footer(text=f"Mise max : {self.cog.m(g, self.cog.store.cfg(g, 'max_bet'))} · "
+                          f"Portefeuille : {self.cog.m(g, wallet)}")
+        return e
+
+    async def _play(self, interaction: discord.Interaction, raw: str):
+        res, err = self.cog.play_slots(self.g, self.uid, raw)
+        if err:
+            return await interaction.response.send_message(err, ephemeral=True)
+        await self.go(interaction, SlotsView(self.cog, self.origin, res))
+
+    @discord.ui.button(label="Miser…", emoji="🎰", style=discord.ButtonStyle.success, row=0)
+    async def bet_btn(self, interaction, button):
+        maxi = self.cog.store.cfg(self.g, "max_bet")
+
+        async def done(inter, raw):
+            await self._play(inter, raw)
+        await interaction.response.send_modal(AmountModal("Machine à sous", f"Maximum : {num(maxi)}", done))
+
+    @discord.ui.button(label="Rejouer", emoji="🔁", style=discord.ButtonStyle.primary, row=0, disabled=True)
+    async def again_btn(self, interaction, button):
+        await self._play(interaction, str(self.last["bet"]))
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await self.home(interaction)
+
+
+class RobView(EcoView):
+    def __init__(self, cog, origin):
+        super().__init__(cog, origin)
+        self.target = None
+        pick = discord.ui.UserSelect(placeholder="Qui veux-tu voler ?", min_values=1, max_values=1, row=0)
+
+        async def on_pick(interaction: discord.Interaction):
+            user = pick.values[0]
+            if user.bot or user.id == self.uid:
+                return await interaction.response.send_message(
+                    "⚠️ Choisis un autre membre (pas toi, pas un bot).", ephemeral=True)
+            self.target = user
+            self.rob_btn.disabled = False
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+        pick.callback = on_pick
+        self.add_item(pick)
+
+    def embed(self):
+        e = self.cog.rob_rules_embed(self.g)
+        if self.target:
+            e.add_field(name="🎯 Cible", value=f"{self.target.mention} : clique sur **Tenter le vol**.", inline=False)
+        return e
+
+    @discord.ui.button(label="Tenter le vol", emoji="🦹", style=discord.ButtonStyle.danger, row=1, disabled=True)
+    async def rob_btn(self, interaction, button):
+        target = self.target
+        ok, text, public = self.cog.do_rob(self.g, self.uid, target.id)
+        if not ok:
+            return await interaction.response.send_message(text, ephemeral=True)
+        await self.home(interaction, text)
+        try:
+            await interaction.channel.send(embed=public, allowed_mentions=discord.AllowedMentions(
+                users=[discord.Object(id=target.id)]))
+        except (discord.HTTPException, AttributeError):
+            pass
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back(self, interaction, button):
+        await self.home(interaction)
+
+
 # ---------- Coinflip entre membres ----------
 class CoinflipButtons(discord.ui.View):
     """Boutons sous chaque pari coinflip. Permanents : ils marchent encore après un redémarrage du bot."""
@@ -672,8 +1001,6 @@ class CoinflipButtons(discord.ui.View):
 
 # ───────────────────────── Cog ─────────────────────────
 class Economie(commands.Cog):
-    eco = app_commands.Group(name="eco", description="Économie du serveur", guild_only=True)
-
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.store = Store(DB_PATH)
@@ -719,14 +1046,6 @@ class Economie(commands.Cog):
         is_admin = getattr(quiz_db, "is_guild_admin", None)
         return bool(guild_id and is_admin is not None and is_admin(guild_id, user_id))
 
-    async def require_admin(self, interaction: discord.Interaction) -> bool:
-        if not self.can_admin(interaction.user.id, interaction.guild_id):
-            await interaction.response.send_message(
-                "⛔ Cette commande est réservée à la personne qui a invité le bot et au propriétaire du bot.\n"
-                f"Ton ID Discord : `{interaction.user.id}`", ephemeral=True)
-            return False
-        return True
-
     async def log_event(self, guild: Optional[discord.Guild], text: str):
         if guild is None:
             return
@@ -771,87 +1090,21 @@ class Economie(commands.Cog):
         self.store.add(g, u, wallet=gain)
         self.store.db.commit()
 
-    # ================= ADMINISTRATION =================
-    @eco.command(name="config", description="Panneau de configuration de l'économie")
-    async def eco_config(self, interaction: discord.Interaction):
-        if not await self.require_admin(interaction):
-            return
-        view = MainPanel(self, interaction)
+    # ---- la commande /eco : ouvre le menu ----
+    @app_commands.command(name="eco", description="Ouvre le menu de l'économie : argent, jeux, classement…")
+    @app_commands.guild_only()
+    async def eco(self, interaction: discord.Interaction):
+        view = EcoHub(self, interaction)
         await interaction.response.send_message(embed=view.embed(), view=view, ephemeral=True)
 
-    @eco.command(name="addmoney", description="Ajouter de l'argent à un membre")
-    @app_commands.describe(membre="Le membre", montant="Montant à ajouter (ex. 5000, 5,000 ou 5k)",
-                           destination="Portefeuille (par défaut) ou banque")
-    @app_commands.choices(destination=[app_commands.Choice(name="Portefeuille", value="wallet"),
-                                       app_commands.Choice(name="Banque", value="bank")])
-    async def addmoney(self, interaction: discord.Interaction, membre: discord.Member, montant: str,
-                       destination: str = "wallet"):
-        if not await self.require_admin(interaction):
-            return
-        amount = parse_int(montant)
-        if amount is None or not 1 <= amount <= 10 ** 12:
-            return await interaction.response.send_message("❌ Montant invalide (ex. `5000`, `5,000` ou `5k`).", ephemeral=True)
-        if membre.bot:
-            return await interaction.response.send_message("❌ Choisis un membre, pas un bot.", ephemeral=True)
-        g = interaction.guild_id
-        applied = self.adjust(g, membre.id, amount, destination)
-        where = "portefeuille" if destination == "wallet" else "banque"
-        await interaction.response.send_message(
-            f"✅ {self.m(g, applied)} ajoutés au {where} de {membre.mention}.", ephemeral=True)
-        await self.log_event(interaction.guild, f"{interaction.user.mention} a ajouté **{self.m(g, applied)}** au {where} de {membre.mention}.")
-
-    @eco.command(name="removemoney", description="Retirer de l'argent à un membre")
-    @app_commands.describe(membre="Le membre", montant="Montant à retirer (ex. 5000, 5,000 ou 5k)",
-                           destination="Portefeuille (par défaut) ou banque")
-    @app_commands.choices(destination=[app_commands.Choice(name="Portefeuille", value="wallet"),
-                                       app_commands.Choice(name="Banque", value="bank")])
-    async def removemoney(self, interaction: discord.Interaction, membre: discord.Member, montant: str,
-                          destination: str = "wallet"):
-        if not await self.require_admin(interaction):
-            return
-        amount = parse_int(montant)
-        if amount is None or not 1 <= amount <= 10 ** 12:
-            return await interaction.response.send_message("❌ Montant invalide (ex. `5000`, `5,000` ou `5k`).", ephemeral=True)
-        if membre.bot:
-            return await interaction.response.send_message("❌ Choisis un membre, pas un bot.", ephemeral=True)
-        g = interaction.guild_id
-        applied = -self.adjust(g, membre.id, -amount, destination)
-        where = "portefeuille" if destination == "wallet" else "banque"
-        await interaction.response.send_message(
-            f"✅ {self.m(g, applied)} retirés du {where} de {membre.mention}.", ephemeral=True)
-        await self.log_event(interaction.guild, f"{interaction.user.mention} a retiré **{self.m(g, applied)}** du {where} de {membre.mention}.")
-
-    # ================= ÉCONOMIE =================
-    @eco.command(name="balance", description="Voir ton solde (ou celui d'un membre)")
-    async def balance(self, interaction: discord.Interaction, membre: Optional[discord.Member] = None):
-        membre = membre or interaction.user
-        g = interaction.guild_id
-        r = self.store.user(g, membre.id)
-        total = r["wallet"] + r["bank"]
-        rank = self.store.db.execute(
-            "SELECT COUNT(*)+1 FROM users WHERE guild_id=? AND wallet+bank>?", (g, total)).fetchone()[0]
-        bonus = self.store.bonus(g, membre.id)
-        self.store.db.commit()
-        e = discord.Embed(title=f"💰 Solde de {membre.display_name}", color=0xF1C40F)
-        e.add_field(name="Portefeuille", value=self.m(g, r["wallet"]))
-        e.add_field(name="Banque", value=self.m(g, r["bank"]))
-        e.add_field(name="Total", value=self.m(g, total))
-        e.add_field(name="Classement", value=f"#{rank}")
-        e.add_field(name="Série /eco daily", value=f"{r['streak']} jour(s)")
-        if bonus:
-            e.add_field(name="⚡ Bonus de gains actif", value=f"+{bonus} %", inline=False)
-        e.set_thumbnail(url=membre.display_avatar.url)
-        await interaction.response.send_message(embed=e)
-
-    @eco.command(name="daily", description="Récupérer ta récompense quotidienne")
-    async def daily(self, interaction: discord.Interaction):
-        g, u, now, cfg = interaction.guild_id, interaction.user.id, time.time(), self.store.cfg
+    # ---- actions de l'économie (appelées par les boutons du menu) ----
+    def claim_daily(self, g, u) -> str:
+        now, cfg = time.time(), self.store.cfg
         cd = cfg(g, "daily_cd") * 3600
         r = self.store.user(g, u)
         ready = r["last_daily"] + cd
         if ready > now:
-            return await interaction.response.send_message(
-                f"⏳ Ta récompense sera prête <t:{int(ready)}:R>.", ephemeral=True)
+            return f"⏳ Ta récompense quotidienne sera prête <t:{int(ready)}:R>."
         streak = r["streak"] + 1 if r["last_daily"] and now - r["last_daily"] <= 2 * cd else 1
         base = cfg(g, "daily_base") + cfg(g, "daily_step") * min(streak - 1, 30)
         gain, bonus = self.store.boosted(g, u, base)
@@ -859,53 +1112,68 @@ class Economie(commands.Cog):
         self.store.db.execute("UPDATE users SET last_daily=?, streak=? WHERE guild_id=? AND user_id=?",
                               (now, streak, g, u))
         self.store.db.commit()
-        e = discord.Embed(title="🎁 Récompense quotidienne", color=0x2ECC71,
-                          description=f"Tu reçois **{self.m(g, gain)}**" + (f" (bonus +{bonus} %)" if bonus else ""))
-        e.add_field(name="Série", value=f"🔥 {streak} jour(s) d'affilée")
-        await interaction.response.send_message(embed=e)
+        return (f"🎁 Récompense quotidienne : **+{self.m(g, gain)}**" + (f" (bonus +{bonus} %)" if bonus else "")
+                + f" · 🔥 série de {streak} jour(s) d'affilée")
 
-    @eco.command(name="deposit", description="Mettre de l'argent à la banque (à l'abri des vols)")
-    @app_commands.describe(montant="Un nombre, « tout », « moitié » ou un pourcentage (ex. 25%)")
-    async def deposit(self, interaction: discord.Interaction, montant: str):
-        g, u = interaction.guild_id, interaction.user.id
-        wallet = self.store.user(g, u)["wallet"]
-        amount = parse_amount(montant, wallet)
-        if not amount or amount < 1 or amount > wallet:
-            return await interaction.response.send_message("❌ Montant invalide.", ephemeral=True)
-        self.store.add(g, u, wallet=-amount, bank=amount)
+    def bank_move(self, g, u, raw: str, deposit: bool) -> str:
+        row = self.store.user(g, u)
+        available = row["wallet"] if deposit else row["bank"]
+        amount = parse_amount(raw, available)
+        if not amount or amount < 1 or amount > available:
+            return f"❌ Montant invalide : tu as {self.m(g, available)} {'dans ton portefeuille' if deposit else 'à la banque'}."
+        if deposit:
+            self.store.add(g, u, wallet=-amount, bank=amount)
+        else:
+            self.store.add(g, u, wallet=amount, bank=-amount)
         self.store.db.commit()
-        await interaction.response.send_message(f"🏦 Tu as déposé **{self.m(g, amount)}** à la banque.")
+        return (f"🏦 Tu as déposé **{self.m(g, amount)}** à la banque." if deposit
+                else f"🏧 Tu as retiré **{self.m(g, amount)}** de la banque.")
 
-    @eco.command(name="withdraw", description="Retirer de l'argent de la banque")
-    @app_commands.describe(montant="Un nombre, « tout », « moitié » ou un pourcentage (ex. 25%)")
-    async def withdraw(self, interaction: discord.Interaction, montant: str):
-        g, u = interaction.guild_id, interaction.user.id
-        bank = self.store.user(g, u)["bank"]
-        amount = parse_amount(montant, bank)
-        if not amount or amount < 1 or amount > bank:
-            return await interaction.response.send_message("❌ Montant invalide.", ephemeral=True)
-        self.store.add(g, u, wallet=amount, bank=-amount)
-        self.store.db.commit()
-        await interaction.response.send_message(f"🏦 Tu as retiré **{self.m(g, amount)}** de la banque.")
-
-    @eco.command(name="pay", description="Envoyer de l'argent à un membre")
-    @app_commands.describe(membre="Le destinataire", montant="Montant (ex. 500, 1,000, 1k, moitié ou tout)")
-    async def pay(self, interaction: discord.Interaction, membre: discord.Member, montant: str):
-        g, u = interaction.guild_id, interaction.user.id
-        if membre.bot or membre.id == u:
-            return await interaction.response.send_message("❌ Destinataire invalide.", ephemeral=True)
+    def do_pay(self, g, u, target_id: int, raw: str):
+        """Envoie de l'argent. Retourne (ok, message pour l'expéditeur, message public ou None)."""
         wallet = self.store.user(g, u)["wallet"]
-        self.store.user(g, membre.id)
-        amount = parse_amount(montant, wallet)
+        self.store.user(g, target_id)
+        amount = parse_amount(raw, wallet)
         if not amount or amount < 1:
-            return await interaction.response.send_message("❌ Montant invalide.", ephemeral=True)
+            return False, "❌ Montant invalide.", None
         if wallet < amount:
-            return await interaction.response.send_message("❌ Fonds insuffisants dans ton portefeuille.", ephemeral=True)
-        self.store.add(g, u, wallet=-amount, reason=f"Envoi à {membre.id}")
-        self.store.add(g, membre.id, wallet=amount, reason=f"Reçu de {u}")
+            return False, f"❌ Fonds insuffisants : tu as {self.m(g, wallet)} dans ton portefeuille.", None
+        self.store.add(g, u, wallet=-amount, reason=f"Envoi à {target_id}")
+        self.store.add(g, target_id, wallet=amount, reason=f"Reçu de {u}")
         self.store.db.commit()
-        await interaction.response.send_message(
-            f"💸 {interaction.user.mention} a envoyé **{self.m(g, amount)}** à {membre.mention}.")
+        return (True, f"💸 Tu as envoyé **{self.m(g, amount)}** à <@{target_id}>.",
+                f"💸 <@{u}> a envoyé **{self.m(g, amount)}** à <@{target_id}>.")
+
+    def leaderboard_embed(self, g) -> discord.Embed:
+        rows = self.store.db.execute(
+            "SELECT user_id, wallet+bank AS total FROM users WHERE guild_id=? ORDER BY total DESC LIMIT 10",
+            (g,)).fetchall()
+        medals = ["🥇", "🥈", "🥉"]
+        lines = [f"{medals[i] if i < 3 else f'**{i + 1}.**'} <@{r['user_id']}> : {self.m(g, r['total'])}"
+                 for i, r in enumerate(rows)]
+        return discord.Embed(title="🏆 Les plus riches", description="\n".join(lines) or "Personne pour l'instant.",
+                             color=0xF1C40F)
+
+    def player_help_embed(self, g) -> discord.Embed:
+        c = self.store.cfg
+        gains = (f"🎁 **Récompense quotidienne** : une fois toutes les {c(g, 'daily_cd')} h. "
+                 "Plus tu l'enchaînes, plus elle grossit.")
+        if c(g, "msg_enabled"):
+            gains += f"\n💬 Écrire dans le serveur rapporte un petit gain (au plus une fois toutes les {c(g, 'msg_cd')} s)."
+        e = discord.Embed(
+            title="📖 Aide de l'économie", color=0x5865F2,
+            description=f"La monnaie du serveur : **{c(g, 'currency')}**. Tout se fait avec les boutons du menu `/eco`.")
+        e.add_field(name="💰 Gagner de l'argent", value=gains, inline=False)
+        e.add_field(name="🏦 Ton argent", value=(
+            "• **Déposer** / **Retirer** : mettre de l'argent à l'abri à la banque (elle ne peut pas être volée) ou le reprendre\n"
+            "• **Envoyer** : donner de l'argent à un membre\n"
+            "• **Classement** : les 10 plus riches"), inline=False)
+        e.add_field(name="🎲 Jeux", value=(
+            f"• **Coinflip** : pari pile ou face contre un membre (mise max {self.m(g, c(g, 'coinflip_max'))})\n"
+            "• **Machine à sous** : gains et probabilités affichés dans l'écran\n"
+            "• **Voler** : piquer le portefeuille d'un membre (règles et probabilités affichées dans l'écran)"), inline=False)
+        e.set_footer(text="Les montants acceptent 5000, 5,000, 5k, « moitié » ou « tout ».")
+        return e
 
     def rob_rules_embed(self, g) -> discord.Embed:
         cfg = self.store.cfg
@@ -928,7 +1196,7 @@ class Economie(commands.Cog):
                           f"versée à ta cible (≈ {fine:g} % en moyenne).", inline=False)
         e.add_field(name="🛡️ Se protéger",
                     value="La banque est intouchable : seul le portefeuille peut être volé. "
-                          "Utilise `/eco deposit` pour mettre ton argent à l'abri.", inline=False)
+                          "Utilise le bouton **Déposer** du menu pour mettre ton argent à l'abri.", inline=False)
         e.add_field(name="⏳ Conditions",
                     value=f"Un vol toutes les **{cd_txt}** · toi et ta cible devez avoir au moins "
                           f"**{self.m(g, cfg(g, 'rob_min'))}** en portefeuille.", inline=False)
@@ -937,52 +1205,45 @@ class Economie(commands.Cog):
                            f"• Cible {self.m(g, 2000)} / toi {self.m(g, 1000)} : **{round(ev(2000, 1000)):+d}** par essai en moyenne\n"
                            f"• Cible {self.m(g, 1000)} / toi {self.m(g, 1000)} : **{round(ev(1000, 1000)):+d}** par essai en moyenne"),
                     inline=False)
-        e.set_footer(text="Tente ta chance avec /eco rob @membre")
+        e.set_footer(text="Choisis une cible, puis clique sur « Tenter le vol ».")
         return e
 
-    @eco.command(name="rob", description="Voler le portefeuille d'un membre (sans cible : règles et probabilités)")
-    @app_commands.describe(membre="La cible du vol (laisse vide pour voir les règles et les probabilités)")
-    async def rob(self, interaction: discord.Interaction, membre: Optional[discord.Member] = None):
-        g, u, now, cfg = interaction.guild_id, interaction.user.id, time.time(), self.store.cfg
-        if membre is None:
-            return await interaction.response.send_message(embed=self.rob_rules_embed(g), ephemeral=True)
+    def do_rob(self, g, u, target_id: int):
+        """Tente un vol. Retourne (ok, texte pour le voleur, embed public ou None)."""
+        cfg, now = self.store.cfg, time.time()
         if not cfg(g, "rob_enabled"):
-            return await interaction.response.send_message("🚫 Le vol est désactivé sur ce serveur.", ephemeral=True)
-        if membre.bot or membre.id == u:
-            return await interaction.response.send_message("❌ Cible invalide.", ephemeral=True)
-        thief, victim = self.store.user(g, u), self.store.user(g, membre.id)
+            return False, "🚫 Le vol est désactivé sur ce serveur.", None
+        if target_id == u:
+            return False, "❌ Cible invalide.", None
+        thief, victim = self.store.user(g, u), self.store.user(g, target_id)
         minimum = cfg(g, "rob_min")
         ready = thief["last_rob"] + cfg(g, "rob_cd") * 60
         if ready > now:
-            return await interaction.response.send_message(
-                f"⏳ La police te surveille… réessaie <t:{int(ready)}:R>.", ephemeral=True)
+            return False, f"⏳ La police te surveille… réessaie <t:{int(ready)}:R>.", None
         if victim["wallet"] < minimum:
-            return await interaction.response.send_message(
-                "❌ Cette personne n'a presque rien dans son portefeuille (la banque est à l'abri).", ephemeral=True)
+            return False, "❌ Cette personne n'a presque rien dans son portefeuille (la banque est à l'abri).", None
         if thief["wallet"] < minimum:
-            return await interaction.response.send_message(
-                f"❌ Il te faut au moins {self.m(g, minimum)} en portefeuille pour tenter un vol.", ephemeral=True)
+            return False, f"❌ Il te faut au moins {self.m(g, minimum)} en portefeuille pour tenter un vol.", None
         self.store.db.execute("UPDATE users SET last_rob=? WHERE guild_id=? AND user_id=?", (now, g, u))
         chance = cfg(g, "rob_chance")
         if random.random() < chance / 100:
             lo = max(1, victim["wallet"] * ROB_STEAL[0] // 100)
             amount = random.randint(lo, max(lo, victim["wallet"] * ROB_STEAL[1] // 100))
-            self.store.add(g, membre.id, wallet=-amount, reason=f"Volé par {u}")
-            self.store.add(g, u, wallet=amount, reason=f"Vol sur {membre.id}")
-            msg = f"🦹 {interaction.user.mention} a volé **{self.m(g, amount)}** à {membre.mention} !"
-            color = 0xE67E22
+            self.store.add(g, target_id, wallet=-amount, reason=f"Volé par {u}")
+            self.store.add(g, u, wallet=amount, reason=f"Vol sur {target_id}")
+            public = f"🦹 <@{u}> a volé **{self.m(g, amount)}** à <@{target_id}> !"
+            text, color = f"🦹 Vol réussi : tu as volé **{self.m(g, amount)}** !", 0xE67E22
         else:
             lo = max(1, thief["wallet"] * ROB_FINE[0] // 100)
             fine = random.randint(lo, max(lo, thief["wallet"] * ROB_FINE[1] // 100))
-            self.store.add(g, u, wallet=-fine, reason=f"Amende (vol raté sur {membre.id})")
-            self.store.add(g, membre.id, wallet=fine, reason=f"Indemnité (vol raté de {u})")
-            msg = (f"🚓 {interaction.user.mention} s'est fait attraper ! "
-                   f"Amende de **{self.m(g, fine)}** versée à {membre.mention}.")
-            color = 0xE74C3C
+            self.store.add(g, u, wallet=-fine, reason=f"Amende (vol raté sur {target_id})")
+            self.store.add(g, target_id, wallet=fine, reason=f"Indemnité (vol raté de {u})")
+            public = f"🚓 <@{u}> s'est fait attraper ! Amende de **{self.m(g, fine)}** versée à <@{target_id}>."
+            text, color = f"🚓 Vol raté : tu paies une amende de **{self.m(g, fine)}**.", 0xE74C3C
         self.store.db.commit()
-        e = discord.Embed(description=msg, color=color)
-        e.set_footer(text=f"Chances de réussite : {chance} % · /eco rob sans cible = règles détaillées")
-        await interaction.response.send_message(embed=e)
+        e = discord.Embed(description=public, color=color)
+        e.set_footer(text=f"Chances de réussite : {chance} %")
+        return True, text, e
 
     def _bet(self, g, u, raw: str):
         """Valide une mise ; retourne (mise, message d'erreur)."""
@@ -1163,70 +1424,34 @@ class Economie(commands.Cog):
             allowed_mentions=discord.AllowedMentions(
                 users=[discord.Object(id=res["creator"]), discord.Object(id=res["joiner"])]))
 
-    @eco.command(name="coinflip", description="Parier pile ou face contre un membre (sans option : voir les paris disponibles)")
-    @app_commands.describe(mise="Ta mise (ex. 500, 1,000, 1k ou tout)", choix="Ton côté de la pièce")
-    @app_commands.choices(choix=[app_commands.Choice(name="Pile", value="pile"),
-                                 app_commands.Choice(name="Face", value="face")])
-    async def coinflip(self, interaction: discord.Interaction, mise: Optional[str] = None, choix: Optional[str] = None):
-        g, u = interaction.guild_id, interaction.user.id
-        if not self.store.cfg(g, "games_enabled"):
-            return await interaction.response.send_message("🚫 Les jeux d'argent sont désactivés sur ce serveur.", ephemeral=True)
-        if mise is None and choix is None:           # liste des paris disponibles
-            self.refund_expired_coinflips(g)
-            rows = self.open_coinflips(g)
-            ttl = self.store.cfg(g, "coinflip_ttl")
-            lines = []
-            for r in rows[:15]:
-                link = (f" · [Aller au pari](https://discord.com/channels/{g}/{r['channel_id']}/{r['message_id']})"
-                        if r["message_id"] else "")
-                lines.append(f"**#{r['id']}** · <@{r['creator_id']}> · **{self.m(g, r['amount'])}** sur **{r['side']}** · "
-                             f"expire <t:{int(r['created'] + ttl * 60)}:R>{link}")
-            e = discord.Embed(title="🪙 Coinflips disponibles", color=0xF1C40F,
-                              description="\n".join(lines) or "Aucun pari disponible pour le moment.")
-            e.add_field(name="Comment ça marche ?", value=(
-                "• **Créer un pari** : `/eco coinflip mise:500 choix:pile`. Il est posté dans le salon avec un bouton **Participer**.\n"
-                "• **Relever un pari** : clique sur **Participer** sous son message (il faut avoir la mise dans ton portefeuille). "
-                "Tu prends l'autre côté de la pièce.\n"
-                f"• Le gagnant empoche les deux mises, le perdant perd la sienne. Un pari que personne ne relève expire après "
-                f"{dur_text(ttl)} (mise rendue)."), inline=False)
-            e.set_footer(text=f"Mise max : {self.m(g, self.store.cfg(g, 'coinflip_max'))}")
-            return await interaction.response.send_message(embed=e, ephemeral=True)
-        if mise is None or choix is None:
-            return await interaction.response.send_message(
-                "❌ Pour créer un pari, indique la `mise` **et** le `choix` (pile ou face). "
-                "Sans option, `/eco coinflip` affiche les paris disponibles.", ephemeral=True)
-        res, err = self.create_coinflip(g, u, choix, mise)
-        if err:
-            return await interaction.response.send_message(err, ephemeral=True)
-        await interaction.response.defer(ephemeral=True)
-        try:
-            msg = await interaction.channel.send(
-                embed=self.coinflip_open_embed(g, interaction.user, res), view=CoinflipButtons(self),
-                allowed_mentions=discord.AllowedMentions.none())
-        except (discord.HTTPException, AttributeError):
-            self.cancel_coinflip(g, u, res["id"])
-            return await interaction.followup.send(
-                "❌ Je n'ai pas pu poster le pari dans ce salon (il me faut la permission d'envoyer des messages et des "
-                "embeds). Ta mise t'a été rendue.", ephemeral=True)
-        self.store.db.execute("UPDATE coinflips SET channel_id=?, message_id=? WHERE id=?",
-                              (msg.channel.id, msg.id, res["id"]))
-        self.store.db.commit()
-        await interaction.followup.send(f"✅ Ton pari est en ligne : {msg.jump_url}", ephemeral=True)
+    def coinflip_menu_embed(self, g, uid, notice: Optional[str] = None) -> discord.Embed:
+        self.refund_expired_coinflips(g)
+        rows = self.open_coinflips(g)
+        ttl = self.store.cfg(g, "coinflip_ttl")
+        lines = []
+        for r in rows[:15]:
+            link = (f" · [Aller au pari](https://discord.com/channels/{g}/{r['channel_id']}/{r['message_id']})"
+                    if r["message_id"] else "")
+            lines.append(f"**#{r['id']}** · <@{r['creator_id']}> · **{self.m(g, r['amount'])}** sur **{r['side']}** · "
+                         f"expire <t:{int(r['created'] + ttl * 60)}:R>{link}"
+                         + (" · *(le tien)*" if r["creator_id"] == uid else ""))
+        e = discord.Embed(title="🪙 Coinflip : paris entre membres", color=0xF1C40F,
+                          description=(f"{notice}\n\n" if notice else "") + ("\n".join(lines) or "Aucun pari disponible pour le moment."))
+        e.add_field(name="Comment ça marche ?", value=(
+            "• **Créer un pari** : clique sur « Créer : pile » ou « Créer : face », puis indique ta mise. "
+            "Le pari est posté dans le salon avec un bouton **Participer**.\n"
+            "• **Relever un pari** : clique sur **Participer** sous son message (il faut avoir la mise dans ton "
+            "portefeuille). Tu prends l'autre côté de la pièce.\n"
+            f"• Le gagnant empoche les deux mises, le perdant perd la sienne. Un pari que personne ne relève expire "
+            f"après {dur_text(ttl)} (mise rendue)."), inline=False)
+        e.set_footer(text=f"Mise max : {self.m(g, self.store.cfg(g, 'coinflip_max'))}")
+        return e
 
-    @eco.command(name="slots", description="Machine à sous (sans mise : voir les gains et les probabilités)")
-    @app_commands.describe(mise="Ta mise (ex. 500, 1,000, 1k, moitié ou tout). Laisse vide pour voir les probabilités.")
-    async def slots(self, interaction: discord.Interaction, mise: Optional[str] = None):
-        g, u = interaction.guild_id, interaction.user.id
-        if mise is None:
-            e = discord.Embed(
-                title="🎰 Machine à sous : gains et probabilités", color=0x9B59B6,
-                description=("Trois symboles sont tirés au hasard. **Tu gagnes dès que deux symboles sont identiques.**\n\n"
-                             + slots_odds_text()))
-            e.set_footer(text=f"Mise max : {self.m(g, self.store.cfg(g, 'max_bet'))} · Pour jouer : /eco slots mise:500")
-            return await interaction.response.send_message(embed=e, ephemeral=True)
-        bet, err = self._bet(g, u, mise)
+    def play_slots(self, g, u, raw: str):
+        """Une partie de machine à sous. Retourne (résultat, None) ou (None, erreur)."""
+        bet, err = self._bet(g, u, raw)
         if err:
-            return await interaction.response.send_message(err, ephemeral=True)
+            return None, err
         reels = random.choices(SLOT_SYMBOLS, SLOT_WEIGHTS, k=3)
         if len(set(reels)) == 1:
             mult, label = SLOT_TRIPLE[reels[0]], "🎉 JACKPOT ! Trois symboles identiques"
@@ -1234,53 +1459,14 @@ class Economie(commands.Cog):
             mult, label = SLOT_PAIR, "Deux symboles identiques"
         else:
             mult, label = 0, "Aucun symbole identique : perdu"
-        payout = int(bet * mult)
-        net = payout - bet
+        net = int(bet * mult) - bet
         self.store.add(g, u, wallet=net, reason="Machine à sous")
         self.store.db.commit()
         outcome = (f"**+{self.m(g, net)}**" if net > 0 else f"**-{self.m(g, -net)}**" if net < 0
-                   else "Mise remboursée")
-        e = discord.Embed(title="🎰 Machine à sous", color=0x2ECC71 if net > 0 else 0xE74C3C,
-                          description=f"**{'  |  '.join(reels)}**\n\n{label}")
-        e.add_field(name="Mise", value=self.m(g, bet))
-        e.add_field(name="Multiplicateur", value=f"×{fr(mult)}" if mult % 1 else f"×{int(mult)}")
-        e.add_field(name="Résultat", value=outcome)
-        e.set_footer(text="Gains et probabilités : /eco slots (sans mise)")
-        await interaction.response.send_message(embed=e)
-
-    @eco.command(name="baltop", description="Classement des membres les plus riches")
-    async def baltop(self, interaction: discord.Interaction):
-        g = interaction.guild_id
-        rows = self.store.db.execute(
-            "SELECT user_id, wallet+bank AS total FROM users WHERE guild_id=? ORDER BY total DESC LIMIT 10",
-            (g,)).fetchall()
-        medals = ["🥇", "🥈", "🥉"]
-        lines = [f"{medals[i] if i < 3 else f'**{i + 1}.**'} <@{r['user_id']}> : {self.m(g, r['total'])}"
-                 for i, r in enumerate(rows)]
-        await interaction.response.send_message(embed=discord.Embed(
-            title="🏆 Les plus riches", description="\n".join(lines) or "Personne pour l'instant.", color=0xF1C40F))
-
-    @eco.command(name="aide", description="Comment fonctionne l'économie : toutes les commandes expliquées")
-    async def aide(self, interaction: discord.Interaction):
-        g, c = interaction.guild_id, self.store.cfg
-        gains = f"• `/eco daily` : récompense toutes les {c(g, 'daily_cd')} h ; plus tu enchaînes les jours, plus elle grossit."
-        if c(g, "msg_enabled"):
-            gains += f"\n• Écrire dans le serveur rapporte un petit gain (au plus une fois toutes les {c(g, 'msg_cd')} s)."
-        e = discord.Embed(
-            title="📖 Aide de l'économie", color=0x5865F2,
-            description=f"La monnaie du serveur : **{c(g, 'currency')}**. Toutes les commandes commencent par `/eco`.")
-        e.add_field(name="💰 Gagner de l'argent", value=gains, inline=False)
-        e.add_field(name="🏦 Ton argent", value=(
-            "• `/eco balance` : ton solde\n"
-            "• `/eco deposit` et `/eco withdraw` : mettre de l'argent à l'abri à la banque (elle ne peut pas être volée) ou le reprendre\n"
-            "• `/eco pay` : envoyer de l'argent à un membre\n"
-            "• `/eco baltop` : le classement des plus riches"), inline=False)
-        e.add_field(name="🎲 Jeux", value=(
-            f"• `/eco coinflip` : pari pile ou face contre un membre (mise max {self.m(g, c(g, 'coinflip_max'))})\n"
-            "• `/eco slots` : machine à sous (sans mise : gains et probabilités)\n"
-            "• `/eco rob` : voler un membre (sans cible : règles et probabilités)"), inline=False)
-        e.set_footer(text="Les montants acceptent 5000, 5,000, 5k, « moitié » ou « tout ».")
-        await interaction.response.send_message(embed=e, ephemeral=True)
+                   else "mise remboursée")
+        mult_txt = f"×{fr(mult)}" if mult % 1 else f"×{int(mult)}"
+        text = f"**{'  |  '.join(reels)}**\n{label}\nMise **{self.m(g, bet)}** · {mult_txt} · {outcome}"
+        return dict(text=text, bet=bet, net=net), None
 
 
 async def setup(bot: commands.Bot):
