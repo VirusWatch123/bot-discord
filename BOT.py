@@ -2384,8 +2384,34 @@ class QuizBot(commands.Bot):
         super().__init__(command_prefix=commands.when_mentioned, intents=intents)
         self.db = Database(DB_PATH)
 
+    async def load_extra_modules(self) -> None:
+        """Charge les autres fichiers du dépôt qui ajoutent leurs commandes au même bot (SUTOM, économie...).
+
+        Un fichier est chargé s'il contient une fonction « setup(bot) » (extension discord.py).
+        """
+        folder = Path(__file__).resolve().parent
+        own_name = Path(__file__).stem
+        for path in sorted(folder.glob("*.py")):
+            name = path.stem
+            if name in (own_name, "keep_alive") or name.startswith("_"):
+                continue
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if not re.search(r"^(?:async\s+)?def\s+setup\s*\(", source, re.M):
+                continue  # pas une extension discord.py : on ne la touche pas
+            try:
+                await self.load_extension(name)
+                log.info("Module chargé : %s", name)
+            except commands.ExtensionAlreadyLoaded:
+                pass
+            except Exception:
+                log.exception("Impossible de charger le module %s", name)
+
     async def setup_hook(self) -> None:
         await self.add_cog(Quiz(self, self.db))
+        await self.load_extra_modules()  # avant la synchronisation : sinon leurs commandes disparaissent
         if not SUPPORTS_FILE_UPLOAD:
             log.warning("discord.py trop ancien : champ de fichier désactivé (pip install -U discord.py).")
         synced = await self.tree.sync()
