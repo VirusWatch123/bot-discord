@@ -154,100 +154,180 @@ async def guard(i):
     await i.response.send_message("Commande réservée aux admins du bot.", ephemeral=True)
     return False
 
-@app_commands.command(name="sutom-mot", description="Définir le mot du jour (admins)")
-@app_commands.describe(mot="Le mot à deviner (5 à 12 lettres)", date="JJ/MM/AAAA (par défaut : aujourd'hui)")
-@app_commands.guild_only()
-async def setmot(i: discord.Interaction, mot: str, date: str = None):
-    if not await guard(i): return
-    w = norm(mot)
-    if not 5 <= len(w) <= 12:
-        return await i.response.send_message("Le mot doit faire entre 5 et 12 lettres.", ephemeral=True)
-    try:
-        d = dt.datetime.strptime(date, "%d/%m/%Y").date().isoformat() if date else today()
-    except ValueError:
-        return await i.response.send_message("Date invalide, format JJ/MM/AAAA.", ephemeral=True)
-    db.execute("INSERT OR REPLACE INTO words VALUES(?,?,?)", (i.guild_id, d, w)); db.commit()
-    await i.response.send_message(f"✅ Mot enregistré pour le {d} : ||{w}||", ephemeral=True)
+# ───────────────────────────── Panneau /sutom ─────────────────────────────
+def adm(i):
+    return (_admin or is_admin)(i.guild_id, i.user.id)
 
-@app_commands.command(name="sutom", description="Jouer au SUTOM du jour")
-@app_commands.guild_only()
-async def sutom(i: discord.Interaction):
-    if not current_word(i.guild_id):
-        return await i.response.send_message("Aucun mot du jour pour l'instant.", ephemeral=True)
+def make_link(i):
     tok = secrets.token_urlsafe(16)
     db.execute("INSERT INTO sessions VALUES(?,?,?,?,?,?,?,?)", (tok, i.guild_id, i.user.id, i.channel_id,
                i.user.display_name, i.user.display_avatar.url, i.guild.name, time.time() + 43200)); db.commit()
-    v = discord.ui.View(); v.add_item(discord.ui.Button(label="Ouvrir le SUTOM", emoji="🟥", url=f"{BASE}/play/{tok}"))
-    await i.response.send_message("Ta grille est prête. Ce lien est personnel, ne le partage pas.", view=v, ephemeral=True)
+    return f"{BASE}/play/{tok}"
 
-@app_commands.command(name="sutom-classement", description="Classement du serveur")
-@app_commands.guild_only()
-async def top(i: discord.Interaction):
-    rows = db.execute("SELECT user,SUM(won),COUNT(*) FROM games WHERE guild=? AND done=1 GROUP BY user "
-                      "ORDER BY 2 DESC,3 ASC LIMIT 10", (i.guild_id,)).fetchall()
-    txt = "\n".join(f"**{n}.** <@{u}> — {w} victoire(s) sur {c} partie(s)" for n, (u, w, c) in enumerate(rows, 1)) or "Personne n'a encore joué."
-    await i.response.send_message(embed=discord.Embed(title="🏆 Classement SUTOM", description=txt, color=0xE5162D),
-                                  allowed_mentions=discord.AllowedMentions.none())
-
-@app_commands.command(name="sutom-add", description="Donner l'accès aux commandes admin du SUTOM")
-@app_commands.guild_only()
-async def add(i: discord.Interaction, membre: discord.Member):
-    if not await guard(i): return
-    db.execute("INSERT OR IGNORE INTO admins VALUES(?,?)", (i.guild_id, membre.id)); db.commit()
-    await i.response.send_message(f"✅ {membre.mention} a maintenant accès aux commandes admin.", ephemeral=True)
-
-@app_commands.command(name="sutom-remove", description="Retirer l'accès aux commandes admin")
-@app_commands.guild_only()
-async def remove(i: discord.Interaction, membre: discord.Member):
-    if not await guard(i): return
-    db.execute("DELETE FROM admins WHERE guild=? AND user=?", (i.guild_id, membre.id)); db.commit()
-    await i.response.send_message(f"✅ Accès retiré à {membre.mention}.", ephemeral=True)
-
-@app_commands.command(name="sutom-mots", description="Ajouter des mots acceptés : jeux, personnages... (admins)")
-@app_commands.describe(mots="Mots séparés par des espaces ou des virgules")
-@app_commands.guild_only()
-async def addmots(i: discord.Interaction, mots: str):
-    if not await guard(i): return
-    ws = {norm(w) for w in re.split(r"[\s,;]+", mots) if 3 <= len(norm(w)) <= 14}
-    db.executemany("INSERT OR IGNORE INTO extra VALUES(?,?)", [(i.guild_id, w) for w in ws]); db.commit()
-    await i.response.send_message(f"✅ {len(ws)} mot(s) ajouté(s) à la liste acceptée.", ephemeral=True)
-
-@app_commands.command(name="sutom-profil", description="Voir les statistiques SUTOM d'un joueur")
-@app_commands.describe(membre="Le joueur (toi par défaut)")
-@app_commands.guild_only()
-async def profil(i: discord.Interaction, membre: discord.Member = None):
-    m = membre or i.user
-    rows = db.execute("SELECT g.day,g.guesses,g.won,w.word FROM games g JOIN words w ON w.guild=g.guild AND w.day=g.day "
-                      "WHERE g.guild=? AND g.user=? AND g.done=1 ORDER BY g.day", (i.guild_id, m.id)).fetchall()
-    if not rows:
-        return await i.response.send_message(f"{m.display_name} n'a pas encore terminé de partie.", ephemeral=True)
-    played, dist, red, yel, blue, tries, cur, best, won_tries = len(rows), [0] * MAX, 0, 0, 0, 0, 0, 0, []
-    for day, gj, won, w in rows:
-        gs = json.loads(gj); tries += len(gs)
+def stats(g, u):
+    rows = db.execute("SELECT g.guesses,g.won,w.word FROM games g JOIN words w ON w.guild=g.guild AND w.day=g.day "
+                      "WHERE g.guild=? AND g.user=? AND g.done=1 ORDER BY g.day", (g, u)).fetchall()
+    st = dict(played=len(rows), dist=[0] * MAX, red=0, yel=0, blue=0, tries=0, cur=0, best=0, won=[])
+    for gj, won, w in rows:
+        gs = json.loads(gj); st["tries"] += len(gs)
         for x in gs:
             for v in score(x, w):
-                if v == 2: red += 1
-                elif v == 1: yel += 1
-                else: blue += 1
+                st[("blue", "yel", "red")[v]] += 1
         if won:
-            dist[len(gs) - 1] += 1; won_tries.append(len(gs)); cur += 1; best = max(best, cur)
+            st["dist"][len(gs) - 1] += 1; st["won"].append(len(gs)); st["cur"] += 1; st["best"] = max(st["best"], st["cur"])
         else:
-            cur = 0
-    wins = len(won_tries)
-    ranking = [u for u, _ in db.execute("SELECT user,SUM(won) w FROM games WHERE guild=? AND done=1 GROUP BY user ORDER BY w DESC", (i.guild_id,))]
-    top = max(dist) or 1
-    bars = "\n".join(f"{n}  {'█' * (max(1, round(10 * c / top)) if c else 0):<10} {c}" for n, c in enumerate(dist, 1))
-    e = discord.Embed(title=f"Profil SUTOM de {m.display_name}", color=0xE5162D)
+            st["cur"] = 0
+    order = [x for x, in db.execute("SELECT user FROM games WHERE guild=? AND done=1 GROUP BY user ORDER BY SUM(won) DESC", (g,))]
+    st["rank"] = order.index(u) + 1 if u in order else None
+    return st
+
+def home_embed(i):
+    e = discord.Embed(title="🟥🟡🟦  SUTOM", color=0xE5162D)
+    e.set_author(name=i.user.display_name, icon_url=i.user.display_avatar.url)
+    cw = current_word(i.guild_id)
+    if cw:
+        day, w = cw
+        g = db.execute("SELECT guesses,done,won FROM games WHERE guild=? AND user=? AND day=?", (i.guild_id, i.user.id, day)).fetchone()
+        n = len(json.loads(g[0])) if g else 0
+        if not g: etat = "Pas encore commencé"
+        elif g[2]: etat = f"🎉 Trouvé en {n}/{MAX}"
+        elif g[1]: etat = "😵 Raté"
+        else: etat = f"⏳ En cours : {n}/{MAX}"
+        e.add_field(name="Mot du jour", value=f"**{len(w)}** lettres\ncommence par **{w[0]}**")
+        e.add_field(name="Ta partie", value=etat)
+    else:
+        e.description = "Aucun mot du jour pour l'instant."
+    st = stats(i.guild_id, i.user.id)
+    if st["played"]:
+        e.add_field(name="Ton bilan", value=f"**{len(st['won'])}** victoires sur **{st['played']}** parties · série **{st['cur']}** · rang **#{st['rank']}**", inline=False)
+    e.set_footer(text="Toi seul(e) peux voir ce panneau")
+    return e
+
+def top_embed(g):
+    rows = db.execute("SELECT user,SUM(won),COUNT(*) FROM games WHERE guild=? AND done=1 GROUP BY user ORDER BY 2 DESC,3 ASC LIMIT 10", (g,)).fetchall()
+    txt = "\n".join(f"**{n}.** <@{u}> : {w} victoire(s) sur {c} partie(s)" for n, (u, w, c) in enumerate(rows, 1)) or "Personne n'a encore joué."
+    return discord.Embed(title="🏆 Classement SUTOM", description=txt, color=0xFFC01E)
+
+def profile_embed(g, m):
+    st = stats(g, m.id)
+    name = getattr(m, "display_name", m.name)
+    if not st["played"]:
+        return discord.Embed(title=f"Profil SUTOM de {name}", description="Aucune partie terminée pour l'instant.", color=0xE5162D)
+    wins, top = len(st["won"]), max(st["dist"]) or 1
+    bars = "\n".join(f"{n}  {'█' * (max(1, round(10 * c / top)) if c else 0):<10} {c}" for n, c in enumerate(st["dist"], 1))
+    e = discord.Embed(title=f"Profil SUTOM de {name}", color=0xE5162D)
     e.set_thumbnail(url=m.display_avatar.url)
-    e.add_field(name="📊 Parties", value=f"**{played}** jouées\n**{wins}** gagnées ({round(100 * wins / played)} %)\n**{played - wins}** ratées")
-    e.add_field(name="🎯 Moyenne", value=(f"**{sum(won_tries) / wins:.2f}** essais\npar mot trouvé\nmeilleur : **{min(won_tries)}** essai(s)" if wins else "Aucun mot trouvé"))
-    e.add_field(name="🔥 Séries", value=f"actuelle : **{cur}**\nrecord : **{best}**\nrang : **#{ranking.index(m.id) + 1}**")
-    e.add_field(name="🟥 Bien placées", value=f"**{red}** lettres")
-    e.add_field(name="🟡 Mal placées", value=f"**{yel}** lettres")
-    e.add_field(name="🟦 Absentes", value=f"**{blue}** lettres")
-    e.add_field(name="⌨️ Mots proposés", value=f"**{tries}** au total", inline=False)
+    e.add_field(name="📊 Parties", value=f"**{st['played']}** jouées\n**{wins}** gagnées ({round(100 * wins / st['played'])} %)\n**{st['played'] - wins}** ratées")
+    e.add_field(name="🎯 Moyenne", value=(f"**{sum(st['won']) / wins:.2f}** essais\npar mot trouvé\nmeilleur : **{min(st['won'])}**" if wins else "Aucun mot trouvé"))
+    e.add_field(name="🔥 Séries", value=f"actuelle : **{st['cur']}**\nrecord : **{st['best']}**\nrang : **#{st['rank']}**")
+    e.add_field(name="🟥 Bien placées", value=f"**{st['red']}** lettres")
+    e.add_field(name="🟡 Mal placées", value=f"**{st['yel']}** lettres")
+    e.add_field(name="🟦 Absentes", value=f"**{st['blue']}** lettres")
+    e.add_field(name="⌨️ Mots proposés", value=f"**{st['tries']}** au total", inline=False)
     e.add_field(name="Répartition des victoires (essais)", value=f"```{bars}```", inline=False)
-    await i.response.send_message(embed=e)
+    return e
+
+def help_embed():
+    return discord.Embed(title="❓ Comment jouer", color=0x1A4BB0, description=(
+        "Devine le mot du jour en **6 essais**. La première lettre est donnée.\n\n"
+        "🟥 lettre **bien placée**\n🟡 lettre présente mais **mal placée**\n🟦 lettre **absente**\n\n"
+        "Chaque proposition doit être un mot qui existe. Le mot du jour est choisi par les admins du bot."))
+
+def admins_embed(g):
+    ids = [OWNER_ID] + [u for u, in db.execute("SELECT user FROM admins WHERE guild=?", (g,)) if u != OWNER_ID]
+    return discord.Embed(title="👥 Accès aux commandes admin", description="\n".join(f"<@{u}>" for u in ids), color=0xFFC01E)
+
+async def deny(i):
+    await i.response.send_message("Réservé aux admins du bot.", ephemeral=True)
+
+class WordModal(discord.ui.Modal, title="Définir le mot du jour"):
+    mot = discord.ui.TextInput(label="Mot à deviner (5 à 12 lettres)", max_length=20)
+    date = discord.ui.TextInput(label="Date JJ/MM/AAAA (vide = aujourd'hui)", required=False, max_length=10)
+
+    async def on_submit(self, i):
+        if not adm(i): return await deny(i)
+        w, ds = norm(self.mot.value), self.date.value.strip()
+        if not 5 <= len(w) <= 12:
+            return await i.response.send_message("Le mot doit faire entre 5 et 12 lettres.", ephemeral=True)
+        try:
+            d = dt.datetime.strptime(ds, "%d/%m/%Y").date().isoformat() if ds else today()
+        except ValueError:
+            return await i.response.send_message("Date invalide, format JJ/MM/AAAA.", ephemeral=True)
+        db.execute("INSERT OR REPLACE INTO words VALUES(?,?,?)", (i.guild_id, d, w)); db.commit()
+        await i.response.send_message(f"✅ Mot enregistré pour le {d} : ||{w}||", ephemeral=True)
+
+class ExtraModal(discord.ui.Modal, title="Mots acceptés en plus"):
+    mots = discord.ui.TextInput(label="Mots acceptés (espaces ou virgules)", style=discord.TextStyle.paragraph, max_length=3000)
+
+    async def on_submit(self, i):
+        if not adm(i): return await deny(i)
+        ws = {norm(w) for w in re.split(r"[\s,;]+", self.mots.value) if 3 <= len(norm(w)) <= 14}
+        db.executemany("INSERT OR IGNORE INTO extra VALUES(?,?)", [(i.guild_id, w) for w in ws]); db.commit()
+        await i.response.send_message(f"✅ {len(ws)} mot(s) ajouté(s) à la liste acceptée.", ephemeral=True)
+
+async def go_home(i, url):
+    await i.response.edit_message(embed=home_embed(i), view=Home(i, url))
+
+class Sub(discord.ui.View):
+    def __init__(self, url):
+        super().__init__(timeout=900); self.url = url
+
+    @discord.ui.button(label="Retour", emoji="↩️", style=discord.ButtonStyle.secondary, row=4)
+    async def back(self, i, b):
+        await go_home(i, self.url)
+
+class ProfView(Sub):
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Voir le profil d'un autre joueur…", row=0)
+    async def other(self, i, sel):
+        await i.response.edit_message(embed=profile_embed(i.guild_id, sel.values[0]), view=self)
+
+class AdminView(Sub):
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Donner l'accès admin à…", row=0)
+    async def give(self, i, sel):
+        if not adm(i): return await deny(i)
+        db.execute("INSERT OR IGNORE INTO admins VALUES(?,?)", (i.guild_id, sel.values[0].id)); db.commit()
+        await i.response.edit_message(embed=admins_embed(i.guild_id), view=self)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="Retirer l'accès admin à…", row=1)
+    async def take(self, i, sel):
+        if not adm(i): return await deny(i)
+        db.execute("DELETE FROM admins WHERE guild=? AND user=?", (i.guild_id, sel.values[0].id)); db.commit()
+        await i.response.edit_message(embed=admins_embed(i.guild_id), view=self)
+
+class Home(discord.ui.View):
+    def __init__(self, i, url):
+        super().__init__(timeout=900); self.url, self.uid = url, i.user.id
+        B, S = discord.ui.Button, discord.ButtonStyle
+        def add(label, emoji, style, row, cb):
+            b = B(label=label, emoji=emoji, style=style, row=row); b.callback = cb; self.add_item(b)
+        self.add_item(B(label="Jouer", emoji="🎮", url=url, row=0, disabled=not current_word(i.guild_id)))
+        add("Classement", "🏆", S.secondary, 0, self.c_top)
+        add("Mon profil", "👤", S.primary, 0, self.c_prof)
+        add("Aide", "❓", S.secondary, 0, self.c_help)
+        if adm(i):
+            add("Définir le mot", "🎯", S.success, 1, self.c_word)
+            add("Mots acceptés", "➕", S.secondary, 1, self.c_extra)
+            add("Admins", "👥", S.secondary, 1, self.c_admins)
+        add("Fermer", "✖️", S.danger, 2, self.c_close)
+
+    async def interaction_check(self, i):
+        return i.user.id == self.uid
+
+    async def c_top(self, i): await i.response.edit_message(embed=top_embed(i.guild_id), view=Sub(self.url))
+    async def c_prof(self, i): await i.response.edit_message(embed=profile_embed(i.guild_id, i.user), view=ProfView(self.url))
+    async def c_help(self, i): await i.response.edit_message(embed=help_embed(), view=Sub(self.url))
+    async def c_word(self, i): await (i.response.send_modal(WordModal()) if adm(i) else deny(i))
+    async def c_extra(self, i): await (i.response.send_modal(ExtraModal()) if adm(i) else deny(i))
+    async def c_admins(self, i):
+        if not adm(i): return await deny(i)
+        await i.response.edit_message(embed=admins_embed(i.guild_id), view=AdminView(self.url))
+    async def c_close(self, i):
+        await i.response.defer(); await i.delete_original_response()
+
+@app_commands.command(name="sutom", description="Ouvrir le panneau SUTOM")
+@app_commands.guild_only()
+async def sutom(i: discord.Interaction):
+    await i.response.send_message(embed=home_embed(i), view=Home(i, make_link(i)), ephemeral=True)
 
 # ───────────────────────────── Serveur web ─────────────────────────────
 def sess(t):
@@ -395,7 +475,7 @@ async def setup(client, tree=None, admin_check=None):
     bot, _admin = client, admin_check
     _t = asyncio.create_task(load_words())
     _t2 = asyncio.create_task(load_games())
-    for c in (setmot, sutom, top, add, remove, addmots, profil):
+    for c in (sutom,):
         (tree or client.tree).add_command(c)
     app = web.Application()
     app.add_routes([web.get("/", ping), web.get("/ping", ping), web.get("/play/{t}", page),
