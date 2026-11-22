@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sqlite3
+import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import date, datetime, time as dtime, timedelta, timezone, tzinfo
@@ -25,7 +26,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-import sutom 
 
 # --------------------------------------------------------------------------- #
 # Configuration
@@ -67,6 +67,7 @@ MAX_DRAFTS = 15                    # questions max par envoi avec /addquiz
 MAX_FILES_PER_QUESTION = 3         # fichiers / images par question
 MAX_QUESTION_FILES_BYTES = 8_000_000   # poids total des fichiers d'une question (8 Mo)
 MAX_PANEL_FILE_BYTES = 30_000_000      # poids total des fichiers d'un envoi /addquiz
+PUBLISH_COOLDOWN = 15.0               # secondes entre deux publications dans un même salon
 
 logging.basicConfig(
     level=logging.INFO,
@@ -485,6 +486,15 @@ class Database:
         ).fetchone()
         return row["points"] if row else 0
 
+    def rank(self, guild_id: int, user_id: int) -> int:
+        """Place du joueur dans le classement (1 = en tête ; égalité = même place)."""
+        row = self.conn.execute(
+            "SELECT COUNT(*) FROM scores WHERE guild_id = ? AND points > "
+            "(SELECT COALESCE(MAX(points), 0) FROM scores WHERE guild_id = ? AND user_id = ?)",
+            (guild_id, guild_id, user_id),
+        ).fetchone()
+        return row[0] + 1
+
     def top(self, guild_id: int, limit: int) -> list[sqlite3.Row]:
         return self.conn.execute(
             "SELECT user_id, points FROM scores WHERE guild_id = ? AND points > 0 "
@@ -892,7 +902,7 @@ class QuestionPanel(discord.ui.View):
             description=(
                 "Clique sur **➕ Ajouter une question**, puis sur **Valider** quand tu as fini.\n"
                 "Avec une heure (et un jour si tu veux), la question est postée à ce moment précis ; "
-                "sans heure, elle reste en stock : tu la postes quand tu veux avec `/nextquiz`.\n"
+                "sans heure, elle reste en stock : tu la postes quand tu veux depuis `/quiz` (Administration).\n"
                 "**🔔 Mention** : choisis qui est mentionné. "
                 "**📎** : joins une image ou un fichier à la dernière question."
             ),
@@ -1072,7 +1082,7 @@ class QuestionPanel(discord.ui.View):
             parts.append(f"{stock} en stock")
         msg = f"✅ **{len(self.drafts)}** question(s) enregistrée(s) ({', '.join(parts)})."
         if stock:
-            msg += "\n💡 Les questions en stock se postent avec `/nextquiz`."
+            msg += "\n💡 Les questions en stock se postent depuis `/quiz` → Administration → Poser maintenant."
         self.stop()
         await interaction.response.edit_message(content=msg, embed=None, view=None)
 
@@ -1172,16 +1182,49 @@ class ImportModal(SafeModal, title="Importer des questions"):
         label="Une question par ligne",
         style=discord.TextStyle.paragraph,
         placeholder="Capitale de la France ? | Paris\n2 + 2 ? | 4 ; quatre",
+        required=False,
         max_length=4000,
     )
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, with_upload: bool = True) -> None:
         super().__init__()
         self.db = db
+        self.upload = None
+        if with_upload and SUPPORTS_FILE_UPLOAD:
+            try:
+                self.upload = discord.ui.FileUpload(required=False, min_values=0, max_values=1)
+                self.add_item(
+                    discord.ui.Label(
+                        text="Ou un fichier .txt (facultatif)",
+                        description="UTF-8, une question par ligne : Question | Réponse",
+                        component=self.upload,
+                    )
+                )
+            except Exception:
+                log.exception("Champ de fichier indisponible : fenêtre ouverte sans ce champ")
+                self.upload = None
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
+        text = self.lines.value or ""
+        attachments = list(getattr(self.upload, "values", None) or []) if self.upload else []
+        if attachments:
+            attachment = attachments[0]
+            if attachment.size > MAX_IMPORT_FILE_SIZE:
+                await interaction.response.send_message("⚠️ Fichier trop volumineux.", ephemeral=True)
+                return
+            await interaction.response.defer(ephemeral=True)
+            try:
+                text += "\n" + (await attachment.read()).decode("utf-8-sig")
+            except UnicodeDecodeError:
+                await interaction.followup.send("⚠️ Le fichier doit être encodé en UTF-8.", ephemeral=True)
+                return
+            await interaction.followup.send(import_questions(self.db, interaction.guild_id, text), ephemeral=True)
+            return
+        if not text.strip():
+            await interaction.response.send_message("⚠️ Colle des questions ou joins un fichier.", ephemeral=True)
+            return
         await interaction.response.send_message(
-            import_questions(self.db, interaction.guild_id, self.lines.value), ephemeral=True
+            import_questions(self.db, interaction.guild_id, text), ephemeral=True
         )
 
 
@@ -1315,7 +1358,7 @@ class NextQuizView(discord.ui.View):
         row = self.cog.db.get_pending_question(interaction.guild_id, self.selected_id or 0)
         if row is None:
             await interaction.response.send_message(
-                "⚠️ Cette question n'est plus en attente : relance `/nextquiz`.", ephemeral=True
+                "⚠️ Cette question n'est plus en attente : rouvre « Poser maintenant ».", ephemeral=True
             )
             return
 
@@ -1430,8 +1473,335 @@ class ConfirmResetView(discord.ui.View):
 
 
 # --------------------------------------------------------------------------- #
+# Panneau /quiz : une seule commande, tout le reste en boutons
+# --------------------------------------------------------------------------- #
+def build_help_embed() -> discord.Embed:
+    return discord.Embed(
+        title="📖 Comment jouer ?",
+        description=(
+            "1️⃣ Une question est postée dans un salon du serveur.\n"
+            "2️⃣ Écris ta réponse **directement dans le chat**, sans commande.\n"
+            "3️⃣ Le premier à trouver la bonne réponse gagne **1 point** ✅\n\n"
+            "💡 La réponse doit être exacte : les majuscules et les accents ne comptent pas, "
+            "mais les symboles (comme & ou !) comptent.\n"
+            "🏆 À la fin de l'événement, la personne qui a le plus de points est mentionnée : "
+            "elle ouvre un ticket pour récupérer sa récompense."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+
+class PanelView(discord.ui.View):
+    """Base des panneaux du /quiz : garde l'interaction pour désactiver les boutons à l'expiration."""
+
+    def __init__(self, cog: "Quiz", interaction: discord.Interaction, timeout: float = 600) -> None:
+        super().__init__(timeout=timeout)
+        self.cog = cog
+        self.interaction = interaction
+
+    def current_question_channel(self) -> int | None:
+        guild_id = self.interaction.guild_id
+        return next((cid for cid, a in self.cog.active.items() if a.guild_id == guild_id), None)
+
+    async def on_timeout(self) -> None:
+        for item in self.children:
+            item.disabled = True  # type: ignore[attr-defined]
+        try:
+            await self.interaction.edit_original_response(view=self)
+        except discord.HTTPException:
+            pass
+
+
+class AdminPanelBase(PanelView):
+    """Panneaux réservés à toi, à la personne qui a invité le bot et aux personnes ajoutées avec « Accès »."""
+
+    manage_access = False  # True : réservé à toi et à la personne qui a invité le bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        db = self.cog.db
+        allowed = db.can_manage_access if self.manage_access else db.has_access
+        if allowed(interaction.user.id, interaction.guild_id):
+            return True
+        await interaction.response.send_message(
+            "⛔ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True
+        )
+        return False
+
+
+class QuizHubView(PanelView):
+    """Accueil du /quiz : ton score, le classement, la question en cours, l'aide et l'administration."""
+
+    def __init__(self, cog: "Quiz", interaction: discord.Interaction) -> None:
+        super().__init__(cog, interaction)
+        if not cog.db.has_access(interaction.user.id, interaction.guild_id):
+            self.remove_item(self.admin_button)  # le bouton n'existe que pour les personnes autorisées
+
+    def build_embed(self) -> discord.Embed:
+        guild_id = self.interaction.guild_id
+        user = self.interaction.user
+        points = self.cog.db.score(guild_id, user.id)
+        rank = f"#{self.cog.db.rank(guild_id, user.id)}" if points > 0 else "—"
+        current = self.current_question_channel()
+        embed = discord.Embed(
+            title=f"🧠 Quiz : {user.display_name}",
+            description="Choisis une action avec les boutons ci-dessous.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Ton score", value=f"**{points}** point{'s' if points > 1 else ''}")
+        embed.add_field(name="Classement", value=rank)
+        embed.add_field(name="Question en cours", value=f"<#{current}>" if current else "Aucune")
+        embed.set_footer(text="Pour jouer, réponds directement dans le salon d'une question.")
+        return embed
+
+    async def _open_result(
+        self, interaction: discord.Interaction, embed: discord.Embed, publishable: bool = True
+    ) -> None:
+        self.stop()
+        view = ResultView(self.cog, interaction, embed, publishable)
+        await interaction.response.edit_message(embed=embed, view=view)
+
+    @discord.ui.button(label="Classement", emoji="🏆", style=discord.ButtonStyle.secondary, row=0)
+    async def leaderboard_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._open_result(interaction, self.cog.build_leaderboard_embed(interaction))
+
+    @discord.ui.button(label="Question en cours", emoji="❓", style=discord.ButtonStyle.secondary, row=0)
+    async def question_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._open_result(interaction, self.cog.build_question_embed(interaction))
+
+    @discord.ui.button(label="Aide", emoji="📖", style=discord.ButtonStyle.secondary, row=0)
+    async def help_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self._open_result(interaction, build_help_embed(), publishable=False)
+
+    @discord.ui.button(label="Administration", emoji="⚙️", style=discord.ButtonStyle.secondary, row=1)
+    async def admin_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not self.cog.db.has_access(interaction.user.id, interaction.guild_id):
+            await interaction.response.send_message(
+                "⛔ Tu n'as pas la permission d'utiliser cette commande.", ephemeral=True
+            )
+            return
+        self.stop()
+        view = AdminHubView(self.cog, interaction)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="Fermer", emoji="❌", style=discord.ButtonStyle.danger, row=1)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        await interaction.response.edit_message(content="Panneau fermé.", embed=None, view=None)
+
+
+class ResultView(PanelView):
+    """Classement, question en cours ou aide, avec « Retour » et « Publier dans le salon »."""
+
+    def __init__(
+        self, cog: "Quiz", interaction: discord.Interaction, embed: discord.Embed, publishable: bool = True
+    ) -> None:
+        super().__init__(cog, interaction, timeout=300)
+        self.embed = embed
+        if not publishable:
+            self.remove_item(self.publish_button)
+
+    @discord.ui.button(label="Retour", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        hub = QuizHubView(self.cog, interaction)
+        await interaction.response.edit_message(embed=hub.build_embed(), view=hub)
+
+    @discord.ui.button(label="Publier dans le salon", emoji="📢", style=discord.ButtonStyle.primary)
+    async def publish_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.send_message(await self.cog.publish(interaction, self.embed), ephemeral=True)
+
+
+class AdminHubView(AdminPanelBase):
+    """Administration : toutes les anciennes commandes réservées (ajouter, importer, poser, supprimer...)."""
+
+    def __init__(self, cog: "Quiz", interaction: discord.Interaction) -> None:
+        super().__init__(cog, interaction)
+        self.channel_id: int | None = None  # salon choisi pour « Ajouter des questions »
+        self.access_button.disabled = not cog.db.can_manage_access(interaction.user.id, interaction.guild_id)
+
+    def build_embed(self) -> discord.Embed:
+        guild_id = self.interaction.guild_id
+        pending = self.cog.db.pending_count(guild_id)
+        stock = self.cog.db.stock(guild_id)
+        current = self.current_question_channel()
+        embed = discord.Embed(
+            title="⚙️ Administration du quiz",
+            description="Gère les questions et l'événement avec les boutons ci-dessous.",
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(
+            name="Questions en attente", value=f"**{pending}** ({stock} en stock, {pending - stock} programmée(s))"
+        )
+        embed.add_field(name="Question en cours", value=f"<#{current}>" if current else "Aucune")
+        embed.add_field(
+            name="Salon des questions",
+            value=f"<#{self.channel_id}>" if self.channel_id else "Le salon où tu es (par défaut)",
+            inline=False,
+        )
+        return embed
+
+    @discord.ui.select(
+        cls=discord.ui.ChannelSelect,
+        channel_types=[discord.ChannelType.text],
+        placeholder="Salon des questions (par défaut : ce salon)",
+        min_values=0,
+        max_values=1,
+        row=0,
+    )
+    async def channel_select(self, interaction: discord.Interaction, select: discord.ui.ChannelSelect) -> None:
+        self.channel_id = select.values[0].id if select.values else None
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Ajouter des questions", emoji="➕", style=discord.ButtonStyle.primary, row=1)
+    async def add_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        salon = interaction.guild.get_channel(self.channel_id) if self.channel_id else None
+        await self.cog.open_addquiz(interaction, salon)
+
+    @discord.ui.button(label="Importer", emoji="📥", style=discord.ButtonStyle.secondary, row=1)
+    async def import_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_import(interaction)
+
+    @discord.ui.button(label="Poser maintenant", emoji="📣", style=discord.ButtonStyle.success, row=1)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_nextquiz(interaction)
+
+    @discord.ui.button(label="Supprimer", emoji="🗑️", style=discord.ButtonStyle.secondary, row=1)
+    async def delete_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        view = DeleteChoiceView(self.cog, interaction)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="Terminer l'événement", emoji="🏁", style=discord.ButtonStyle.danger, row=2)
+    async def end_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_end(interaction)
+
+    @discord.ui.button(label="Scores à zéro", emoji="🧹", style=discord.ButtonStyle.danger, row=2)
+    async def reset_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.open_reset(interaction)
+
+    @discord.ui.button(label="Accès", emoji="👥", style=discord.ButtonStyle.secondary, row=2)
+    async def access_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        view = AccessView(self.cog, interaction)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+    @discord.ui.button(label="Retour", emoji="↩️", style=discord.ButtonStyle.secondary, row=2)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        hub = QuizHubView(self.cog, interaction)
+        await interaction.response.edit_message(embed=hub.build_embed(), view=hub)
+
+
+class DeleteChoiceView(AdminPanelBase):
+    """Supprimer la dernière question ajoutée ou toutes celles en attente."""
+
+    def build_embed(self) -> discord.Embed:
+        count = self.cog.db.pending_count(self.interaction.guild_id)
+        return discord.Embed(
+            title="🗑️ Supprimer des questions",
+            description=(
+                f"**{count}** question(s) en attente (stock et programmées).\n"
+                "Choisis ce que tu veux supprimer. La question déjà postée n'est pas touchée."
+            ),
+            color=discord.Color.red(),
+        )
+
+    @discord.ui.button(label="La dernière ajoutée", emoji="↩️", style=discord.ButtonStyle.secondary)
+    async def last_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.delete_questions(interaction, "derniere")
+
+    @discord.ui.button(label="Toutes en attente", emoji="🗑️", style=discord.ButtonStyle.danger)
+    async def all_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.delete_questions(interaction, "toutes")
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        view = AdminHubView(self.cog, interaction)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+class AccessView(AdminPanelBase):
+    """Donner ou retirer l'accès aux commandes d'administration à un membre (propre à ce serveur)."""
+
+    manage_access = True
+
+    def __init__(self, cog: "Quiz", interaction: discord.Interaction) -> None:
+        super().__init__(cog, interaction)
+        self.target: discord.Member | None = None
+
+    def build_embed(self) -> discord.Embed:
+        guild_id = self.interaction.guild_id
+        admins = self.cog.db.list_guild_admins(guild_id)
+        helpers = self.cog.db.list_helpers(guild_id)
+        embed = discord.Embed(
+            title="👥 Accès au quiz",
+            description=(
+                "Choisis un membre, puis donne-lui ou retire-lui l'accès aux commandes d'administration "
+                "**sur ce serveur**."
+            ),
+            color=discord.Color.blurple(),
+        )
+        embed.add_field(name="Membre choisi", value=self.target.mention if self.target else "Personne", inline=False)
+        embed.add_field(
+            name="👑 Accès complet",
+            value=(", ".join(f"<@{uid}>" for uid in admins) or "Personne")[:1000],
+            inline=False,
+        )
+        embed.add_field(
+            name="✅ Autorisés",
+            value=(", ".join(f"<@{uid}>" for uid in helpers) or "Personne")[:1000],
+            inline=False,
+        )
+        return embed
+
+    @discord.ui.select(
+        cls=discord.ui.UserSelect,
+        placeholder="Choisis un membre du serveur",
+        min_values=1,
+        max_values=1,
+        row=0,
+    )
+    async def pick_user(self, interaction: discord.Interaction, select: discord.ui.UserSelect) -> None:
+        user = select.values[0]
+        if not isinstance(user, discord.Member):
+            await interaction.response.send_message(
+                "⚠️ Cette personne n'est pas membre de ce serveur.", ephemeral=True
+            )
+            return
+        self.target = user
+        self.give_button.disabled = False
+        self.remove_button.disabled = False
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    @discord.ui.button(label="Donner l'accès", emoji="✅", style=discord.ButtonStyle.success, row=1, disabled=True)
+    async def give_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.apply_access(interaction, self.target, False)
+
+    @discord.ui.button(label="Retirer l'accès", emoji="🗑️", style=discord.ButtonStyle.danger, row=1, disabled=True)
+    async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await self.cog.apply_access(interaction, self.target, True)
+
+    @discord.ui.button(label="Retour", emoji="⬅️", style=discord.ButtonStyle.secondary, row=1)
+    async def back_button(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        self.stop()
+        view = AdminHubView(self.cog, interaction)
+        await interaction.response.edit_message(embed=view.build_embed(), view=view)
+
+
+# --------------------------------------------------------------------------- #
 # Cog principal
 # --------------------------------------------------------------------------- #
+class BotNotInServer(app_commands.CheckFailure):
+    """La commande est utilisée dans un serveur dont le bot n'est pas membre (app installée sur un compte)."""
+
+
+def guild_install_only():
+    """Commande disponible uniquement dans les serveurs où le bot est installé (pas via « Ajouter à mes apps »)."""
+    decorator = getattr(app_commands, "allowed_installs", None)  # discord.py 2.4 et plus
+    return decorator(guilds=True, users=False) if decorator else (lambda func: func)
+
+
 def authorized_only():
     """Réservé à toi, à la personne qui a invité le bot et aux personnes ajoutées avec /add (sur ce serveur)."""
 
@@ -1458,6 +1828,13 @@ class Quiz(commands.Cog):
         self.db = db
         self.active: dict[int, ActiveQuestion] = {}  # channel_id -> question en cours
         self.last_send_error: str | None = None      # raison du dernier refus d'envoi par Discord
+        self._publish_at: dict[int, float] = {}      # salon -> dernière publication (anti-spam)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        """Vérifié pour toutes les commandes : le bot doit être réellement membre du serveur."""
+        if interaction.guild is None:
+            raise BotNotInServer()
+        return True
 
     async def cog_load(self) -> None:
         for row in self.db.active_questions():
@@ -1467,16 +1844,33 @@ class Quiz(commands.Cog):
     async def cog_unload(self) -> None:
         self.scheduler.cancel()
 
-    # ------------------------- Ajout de questions ------------------------- #
+    # ------------------------------ Panneau /quiz -------------------------- #
     @app_commands.command(
-        name="addquiz", description="Poser des questions (jour, heure, mention et fichiers au choix)"
-    )
-    @app_commands.describe(
-        salon="Salon où poser les questions (par défaut : le salon où tu tapes la commande)",
+        name="quiz", description="Ouvrir le panneau du quiz (classement, question, administration)"
     )
     @app_commands.guild_only()
-    @authorized_only()
-    async def addquiz(
+    @guild_install_only()
+    async def quiz(self, interaction: discord.Interaction) -> None:
+        view = QuizHubView(self, interaction)
+        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+
+    async def publish(self, interaction: discord.Interaction, embed: discord.Embed) -> str:
+        """Publie un embed (classement, question) dans le salon, sans aucune mention."""
+        now = time.monotonic()
+        wait = PUBLISH_COOLDOWN - (now - self._publish_at.get(interaction.channel_id, -1e9))
+        if wait > 0:
+            return f"⏳ Patiente encore {wait:.0f} s avant de republier dans ce salon."
+        try:
+            await interaction.channel.send(  # type: ignore[union-attr]
+                embed=embed, allowed_mentions=discord.AllowedMentions.none()
+            )
+        except discord.HTTPException:
+            return "❌ Je ne peux pas écrire dans ce salon (permissions manquantes)."
+        self._publish_at[interaction.channel_id] = now
+        return "📢 Publié dans le salon."
+
+    # ------------------------- Ajout de questions ------------------------- #
+    async def open_addquiz(
         self, interaction: discord.Interaction, salon: discord.TextChannel | None = None
     ) -> None:
         cfg = self.db.get_schedule(interaction.guild_id)
@@ -1487,7 +1881,7 @@ class Quiz(commands.Cog):
         )
         if not isinstance(channel, discord.TextChannel):
             await interaction.response.send_message(
-                "⚠️ Choisis un salon textuel avec l'option `salon`.", ephemeral=True
+                "⚠️ Choisis un salon textuel dans le menu « Salon des questions ».", ephemeral=True
             )
             return
         perms = channel.permissions_for(interaction.guild.me)
@@ -1500,64 +1894,38 @@ class Quiz(commands.Cog):
         panel = QuestionPanel(self.db, interaction, channel)
         await interaction.response.send_message(embed=panel.build_embed(), view=panel, ephemeral=True)
 
-    @app_commands.command(
-        name="importquiz", description="Importer plusieurs questions (fenêtre ou fichier .txt)"
-    )
-    @app_commands.describe(fichier="Fichier texte UTF-8 : une question par ligne, « Question | Réponse »")
-    @app_commands.guild_only()
-    @authorized_only()
-    async def importquiz(
-        self, interaction: discord.Interaction, fichier: discord.Attachment | None = None
-    ) -> None:
-        if fichier is None:
-            await interaction.response.send_modal(ImportModal(self.db))
-            return
-        if fichier.size > MAX_IMPORT_FILE_SIZE:
-            await interaction.response.send_message("⚠️ Fichier trop volumineux.", ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
+    async def open_import(self, interaction: discord.Interaction) -> None:
         try:
-            text = (await fichier.read()).decode("utf-8-sig")
-        except UnicodeDecodeError:
-            await interaction.followup.send("⚠️ Le fichier doit être encodé en UTF-8.", ephemeral=True)
-            return
-        await interaction.followup.send(
-            import_questions(self.db, interaction.guild_id, text), ephemeral=True
-        )
+            await interaction.response.send_modal(ImportModal(self.db))
+        except discord.HTTPException:
+            # Discord a refusé la fenêtre avec le champ de fichier : on l'ouvre sans.
+            log.exception("Fenêtre d'import avec champ de fichier refusée : ouverture sans ce champ")
+            await interaction.response.send_modal(ImportModal(self.db, with_upload=False))
 
-    @app_commands.command(
-        name="nextquiz", description="Choisir une question en attente (stock ou programmée) et la poser tout de suite"
-    )
-    @app_commands.guild_only()
-    @authorized_only()
-    async def nextquiz(self, interaction: discord.Interaction) -> None:
+    async def open_nextquiz(self, interaction: discord.Interaction) -> None:
         rows = self.db.pending_questions(interaction.guild_id)
         if not rows:
             await interaction.response.send_message(
-                "📭 Aucune question en attente. Ajoutes-en avec `/addquiz` ou `/importquiz`.", ephemeral=True
+                "📭 Aucune question en attente. Ajoutes-en depuis `/quiz` → Administration.", ephemeral=True
             )
             return
         view = NextQuizView(self, interaction, rows)
         await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
     # ------------------------- Rappel de la question ---------------------- #
-    @app_commands.command(name="question", description="Rappeler la question en cours")
-    @app_commands.guild_only()
-    @app_commands.checks.cooldown(1, 15.0, key=lambda i: i.channel_id)
-    async def question(self, interaction: discord.Interaction) -> None:
-        no_ping = discord.AllowedMentions.none()  # aucune mention, quoi qu'il arrive
+    def build_question_embed(self, interaction: discord.Interaction) -> discord.Embed:
+        """Rappel de la question en cours dans ce salon (aucune mention)."""
         active = self.active.get(interaction.channel_id)
         if active is None:
             elsewhere = next(
                 (cid for cid, a in self.active.items() if a.guild_id == interaction.guild_id), None
             )
-            msg = (
+            text = (
                 f"📭 Pas de question dans ce salon. La question en cours est dans <#{elsewhere}>."
                 if elsewhere
                 else "📭 Aucune question en cours."
             )
-            await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=no_ping)
-            return
+            return discord.Embed(title="❓ Question en cours", description=text, color=discord.Color.blurple())
 
         embed = discord.Embed(
             title="❓ Rappel de la question",
@@ -1568,17 +1936,10 @@ class Quiz(commands.Cog):
         if active.message_id:
             url = f"https://discord.com/channels/{interaction.guild_id}/{interaction.channel_id}/{active.message_id}"
             embed.add_field(name="Message d'origine", value=f"[Aller à la question]({url})", inline=False)
-        await interaction.response.send_message(embed=embed, allowed_mentions=no_ping)
+        return embed
 
     # ------------------------------ Accès au bot --------------------------- #
-    @app_commands.command(name="add", description="Donner (ou retirer) l'accès aux commandes du bot sur ce serveur")
-    @app_commands.describe(
-        utilisateur="Membre de ce serveur à qui donner l'accès",
-        retirer="Mets True pour retirer son accès au lieu de le donner",
-    )
-    @app_commands.guild_only()
-    @access_manager_only()
-    async def add(
+    async def apply_access(
         self, interaction: discord.Interaction, utilisateur: discord.Member, retirer: bool = False
     ) -> None:
         guild_id = interaction.guild_id
@@ -1610,19 +1971,9 @@ class Quiz(commands.Cog):
         )
 
     # ---------------------------- Supprimer des questions ------------------ #
-    @app_commands.command(name="supprimer", description="Supprimer la dernière question ou toutes celles en attente")
-    @app_commands.describe(choix="Que veux-tu supprimer ?")
-    @app_commands.choices(
-        choix=[
-            app_commands.Choice(name="La dernière question ajoutée", value="derniere"),
-            app_commands.Choice(name="Toutes les questions en attente", value="toutes"),
-        ]
-    )
-    @app_commands.guild_only()
-    @authorized_only()
-    async def supprimer(self, interaction: discord.Interaction, choix: app_commands.Choice[str]) -> None:
+    async def delete_questions(self, interaction: discord.Interaction, choix: str) -> None:
         guild_id = interaction.guild_id
-        if choix.value == "derniere":
+        if choix == "derniere":
             row = self.db.delete_last_pending(guild_id)
             if row is None:
                 await interaction.response.send_message("📭 Aucune question en attente.", ephemeral=True)
@@ -1655,10 +2006,7 @@ class Quiz(commands.Cog):
         )
 
     # ----------------------------- Fin de l'événement --------------------- #
-    @app_commands.command(name="end", description="Terminer l'événement et annoncer le gagnant")
-    @app_commands.guild_only()
-    @authorized_only()
-    async def end_event(self, interaction: discord.Interaction) -> None:
+    async def open_end(self, interaction: discord.Interaction) -> None:
         winners = self.db.winners(interaction.guild_id)
         if not winners:
             await interaction.response.send_message(
@@ -1750,17 +2098,18 @@ class Quiz(commands.Cog):
         ]
         if cancelled:
             lines.append(f"🗑️ {cancelled} question(s) programmée(s) annulée(s).")
-        lines.append("ℹ️ Les scores sont conservés : utilise `/reset` pour repartir de zéro.")
+        lines.append("ℹ️ Les scores sont conservés : utilise « Scores à zéro » (`/quiz` → Administration) pour repartir de zéro.")
         return "\n".join(lines)
 
     # ------------------------ Classement et reset ------------------------- #
-    @app_commands.command(name="leaderboard", description="Afficher le classement des meilleurs joueurs")
-    @app_commands.guild_only()
-    async def leaderboard(self, interaction: discord.Interaction) -> None:
+    def build_leaderboard_embed(self, interaction: discord.Interaction) -> discord.Embed:
         rows = self.db.top(interaction.guild_id, LEADERBOARD_SIZE)
         if not rows:
-            await interaction.response.send_message("📭 Personne n'a encore de point.", ephemeral=True)
-            return
+            return discord.Embed(
+                title="🏆 Classement du quiz",
+                description="📭 Personne n'a encore de point.",
+                color=discord.Color.gold(),
+            )
 
         medals = ["🥇", "🥈", "🥉"]
         lines = []
@@ -1776,12 +2125,9 @@ class Quiz(commands.Cog):
         )
         own = self.db.score(interaction.guild_id, interaction.user.id)
         embed.set_footer(text=f"Ton score : {own} point(s)")
-        await interaction.response.send_message(embed=embed)
+        return embed
 
-    @app_commands.command(name="reset", description="Remettre tous les scores à zéro")
-    @app_commands.guild_only()
-    @authorized_only()
-    async def reset(self, interaction: discord.Interaction) -> None:
+    async def open_reset(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             "⚠️ Remettre **tous** les scores à zéro ? Cette action est irréversible.",
             view=ConfirmResetView(self.db),
@@ -1791,7 +2137,15 @@ class Quiz(commands.Cog):
     async def cog_app_command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        if isinstance(error, app_commands.CommandOnCooldown):
+        if isinstance(error, BotNotInServer):
+            bot_id = interaction.client.user.id  # type: ignore[union-attr]
+            msg = (
+                "⚠️ Je ne suis pas membre de ce serveur, je ne peux donc pas y écrire.\n"
+                "Un administrateur doit m'ajouter **au serveur** avec ce lien :\n"
+                f"https://discord.com/oauth2/authorize?client_id={bot_id}&permissions=117952"
+                "&integration_type=0&scope=bot%20applications.commands"
+            )
+        elif isinstance(error, app_commands.CommandOnCooldown):
             msg = f"⏳ Patiente encore {error.retry_after:.0f} s avant de réutiliser cette commande."
         elif isinstance(error, app_commands.CheckFailure):
             msg = "⛔ Tu n'as pas la permission d'utiliser cette commande."
@@ -1923,7 +2277,7 @@ class Quiz(commands.Cog):
             try:
                 await channel.send(
                     "📭 Le stock de questions est vide : la planification est arrêtée. "
-                    "Un administrateur peut ajouter des questions avec `/addquiz`."
+                    "Un administrateur peut ajouter des questions depuis `/quiz` → Administration."
                 )
             except discord.HTTPException:
                 pass
@@ -2034,11 +2388,6 @@ class QuizBot(commands.Bot):
         await self.add_cog(Quiz(self, self.db))
         if not SUPPORTS_FILE_UPLOAD:
             log.warning("discord.py trop ancien : champ de fichier désactivé (pip install -U discord.py).")
-        await sutom.setup(self)  # commandes + page du SUTOM (doit passer avant la synchronisation)
-        try:
-            await self.load_extension("economie")  # système d'économie et de boutique (economie.py)
-        except Exception:
-            log.exception("Impossible de charger economie.py : le bot continue sans l'économie.")
         synced = await self.tree.sync()
         log.info("%d commande(s) slash synchronisée(s).", len(synced))
 
@@ -2052,7 +2401,13 @@ def main() -> None:
             "Token introuvable : crée un fichier .env à côté de quiz_bot.py "
             "contenant la ligne DISCORD_TOKEN=ton_token"
         )
-    # Keep alive : assuré par sutom.py (route /ping), l'ancien keep_alive.py n'est plus lancé.
+    try:
+        from keep_alive import keep_alive  # facultatif : utile sur Replit
+
+        keep_alive()
+    except ImportError as err:
+        # Le message entre parenthèses donne la vraie raison : « flask » ou « keep_alive » introuvable.
+        log.warning("Keep alive non lancé (%s). Le bot démarre quand même.", err)
     QuizBot().run(TOKEN, log_handler=None)
 
 
