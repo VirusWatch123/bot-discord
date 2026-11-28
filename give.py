@@ -15,10 +15,15 @@ VARIABLES D'ENVIRONNEMENT (le token n'est jamais écrit dans le code)
 ────────────────────────────────────────────────────────────────────
 DISCORD_TOKEN       token du bot (mode autonome uniquement ; "TOKEN" marche aussi)
 GIVEAWAY_DB         chemin de la base SQLite           (défaut : giveaway.db)
-GIVEAWAY_ADMIN_IDS  IDs Discord autorisés partout, séparés par des virgules
-GIVEAWAY_STRICT     "1" → seuls le propriétaire du bot, GIVEAWAY_ADMIN_IDS et le
-                    propriétaire du serveur peuvent utiliser /giveaway
+GIVEAWAY_ADMIN_IDS  IDs Discord supplémentaires avec tous les droits (optionnel)
 PORT                port du keep alive (défaut : 8080)
+
+ACCÈS
+─────
+Seul le propriétaire (OWNER_ID plus bas) peut ouvrir /giveaway au départ, même s'il y a
+des admins sur le serveur. Il ajoute d'autres personnes (propres à chaque serveur) avec
+le bouton « Accès » du panneau ; elles peuvent alors utiliser /giveaway, mais seul le
+propriétaire peut ajouter ou retirer des accès.
 
 Aucun intent privilégié n'est nécessaire (ni « members », ni « message content »).
 """
@@ -52,8 +57,8 @@ except Exception:  # tzdata absent
 
 # ═══════════════════════════ CONSTANTES ═══════════════════════════
 DB_PATH = os.getenv("GIVEAWAY_DB", "giveaway.db")
-EXTRA_ADMINS = {int(x) for x in re.findall(r"\d+", os.getenv("GIVEAWAY_ADMIN_IDS", ""))}
-STRICT = os.getenv("GIVEAWAY_STRICT", "0") == "1"
+OWNER_ID = 1258814145969782845  # seule personne avec tous les droits (donne l'accès aux autres)
+OWNER_IDS = {OWNER_ID} | {int(x) for x in re.findall(r"\d+", os.getenv("GIVEAWAY_ADMIN_IDS", ""))}
 
 MAX_WINNERS = 50
 MAX_RUNNING = 25  # = limite d'un menu déroulant Discord
@@ -72,7 +77,7 @@ DEFAULT_CFG: dict[str, Any] = {
     "dm": True,
     "channel": None,
     "ping": None,
-    "managers": [],
+    "allowed": [],
     "blacklist": [],
 }
 
@@ -444,6 +449,9 @@ class BaseView(discord.ui.View):
         if interaction.user.id != self.owner_id:
             await safe_reply(interaction, "Ce panneau ne t'appartient pas : tape `/giveaway` pour ouvrir le tien.")
             return False
+        if interaction.guild is None or not await self.cog.is_manager(interaction.user, interaction.guild):
+            await safe_reply(interaction, "⛔ Tu n'as plus accès à la gestion des giveaways.")
+            return False
         return True
 
     async def on_error(self, interaction: discord.Interaction, error: Exception, item: discord.ui.Item) -> None:
@@ -515,6 +523,11 @@ class LeaveView(discord.ui.View):
 
 # ═══════════════════════════ PANNEAU PRINCIPAL ═══════════════════════════
 class PanelView(BaseView):
+    def __init__(self, cog: "Giveaway", owner_id: int):
+        super().__init__(cog, owner_id)
+        if not cog.is_owner(owner_id):  # seuls les propriétaires voient le bouton « Accès »
+            self.remove_item(self.access)
+
     @discord.ui.button(label="Créer", emoji="➕", style=discord.ButtonStyle.success, row=0)
     async def create(self, interaction: discord.Interaction, button: discord.ui.Button):
         row = await self.cog.db.one(
@@ -549,6 +562,13 @@ class PanelView(BaseView):
     @discord.ui.button(label="Blacklist", emoji="🚫", style=discord.ButtonStyle.danger, row=1)
     async def blacklist(self, interaction: discord.Interaction, button: discord.ui.Button):
         view = BlacklistView(self.cog, interaction.user.id, await self.cog.get_cfg(interaction.guild_id), interaction.guild_id)
+        await interaction.response.edit_message(embed=view.embed(), view=view)
+
+    @discord.ui.button(label="Accès", emoji="🔑", style=discord.ButtonStyle.primary, row=1)
+    async def access(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.cog.is_owner(interaction.user.id):
+            return await safe_reply(interaction, "⛔ Seul le propriétaire peut gérer les accès.")
+        view = AccessView(self.cog, interaction.user.id, await self.cog.get_cfg(interaction.guild_id), interaction.guild_id)
         await interaction.response.edit_message(embed=view.embed(), view=view)
 
 
@@ -1106,7 +1126,7 @@ class ConfigView(BaseView):
         super().__init__(cog, owner_id)
         self.cfg, self.guild_id = cfg, guild_id
         self._sync_toggle()
-        self.add_item(back_button(cog, row=3))
+        self.add_item(back_button(cog, row=2))
 
     def _sync_toggle(self) -> None:
         self.toggle_dm.label = "MP aux gagnants : " + ("activé" if self.cfg["dm"] else "désactivé")
@@ -1123,11 +1143,6 @@ class ConfigView(BaseView):
         e.add_field(name="📢 Mention par défaut", value=ping, inline=True)
         e.add_field(name="📩 MP aux gagnants", value="Oui" if c["dm"] else "Non", inline=True)
         e.add_field(name="🎨 Apparence", value=f"Couleur `#{c['color']:06x}` • bouton {c['emoji']} **{c['label']}**", inline=False)
-        e.add_field(
-            name="🛡️ Rôles gestionnaires",
-            value=(", ".join(f"<@&{r}>" for r in c["managers"]) or "Aucun") + "\n*Les admins et ceux qui ont « Gérer le serveur » ont toujours accès.*",
-            inline=False,
-        )
         return e
 
     @discord.ui.select(
@@ -1140,16 +1155,7 @@ class ConfigView(BaseView):
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
     @discord.ui.select(
-        cls=discord.ui.RoleSelect, placeholder="🛡️ Rôles autorisés à gérer les giveaways",
-        min_values=0, max_values=10, row=1,
-    )
-    async def s_managers(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
-        self.cfg["managers"] = [r.id for r in select.values if not r.is_default()]
-        await self.save()
-        await interaction.response.edit_message(embed=self.embed(), view=self)
-
-    @discord.ui.select(
-        cls=discord.ui.RoleSelect, placeholder="📢 Rôle mentionné par défaut", min_values=1, max_values=1, row=2,
+        cls=discord.ui.RoleSelect, placeholder="📢 Rôle mentionné par défaut", min_values=1, max_values=1, row=1,
     )
     async def s_ping(self, interaction: discord.Interaction, select: discord.ui.RoleSelect):
         role = select.values[0]
@@ -1157,18 +1163,18 @@ class ConfigView(BaseView):
         await self.save()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Apparence", emoji="🎨", style=discord.ButtonStyle.primary, row=3)
+    @discord.ui.button(label="Apparence", emoji="🎨", style=discord.ButtonStyle.primary, row=2)
     async def b_look(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_modal(AppearanceModal(self))
 
-    @discord.ui.button(label="MP aux gagnants", row=3)
+    @discord.ui.button(label="MP aux gagnants", row=2)
     async def toggle_dm(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.cfg["dm"] = not self.cfg["dm"]
         self._sync_toggle()
         await self.save()
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
-    @discord.ui.button(label="Réinitialiser salon & mention", emoji="🧹", style=discord.ButtonStyle.secondary, row=3)
+    @discord.ui.button(label="Réinitialiser salon & mention", emoji="🧹", style=discord.ButtonStyle.secondary, row=2)
     async def b_reset(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.cfg["channel"] = None
         self.cfg["ping"] = None
@@ -1210,6 +1216,52 @@ class BlacklistView(BaseView):
         await interaction.response.edit_message(embed=self.embed(), view=self)
 
 
+class AccessView(BaseView):
+    """Qui peut utiliser /giveaway sur ce serveur (réservé au propriétaire)."""
+
+    def __init__(self, cog: "Giveaway", owner_id: int, cfg: dict, guild_id: int):
+        super().__init__(cog, owner_id)
+        self.cfg, self.guild_id = cfg, guild_id
+        self.add_item(back_button(cog, row=2))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if not self.cog.is_owner(interaction.user.id):
+            await safe_reply(interaction, "⛔ Seul le propriétaire peut gérer les accès.")
+            return False
+        return await super().interaction_check(interaction)
+
+    def embed(self) -> discord.Embed:
+        allowed = self.cfg["allowed"]
+        txt = "\n".join(f"• <@{u}>" for u in allowed[:40]) or "*Personne pour l'instant.*"
+        if len(allowed) > 40:
+            txt += f"\n… et {len(allowed) - 40} autre(s)"
+        return discord.Embed(
+            title="🔑 Accès au panneau giveaway",
+            description=(
+                "Les personnes ajoutées peuvent utiliser `/giveaway` **sur ce serveur**. "
+                "Seul toi peux ajouter ou retirer des accès.\n\n"
+                f"**Propriétaire :** <@{OWNER_ID}>\n**Personnes ajoutées :**\n{txt}"
+            ),
+            color=discord.Color.blurple(),
+        )
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="➕ Ajouter une ou plusieurs personnes", min_values=1, max_values=10, row=0)
+    async def add(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        allowed = self.cfg["allowed"]
+        for u in select.values:
+            if not u.bot and u.id not in OWNER_IDS and u.id not in allowed and len(allowed) < 100:
+                allowed.append(u.id)
+        await self.cog.save_cfg(self.guild_id, self.cfg)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.select(cls=discord.ui.UserSelect, placeholder="➖ Retirer l'accès", min_values=1, max_values=10, row=1)
+    async def remove(self, interaction: discord.Interaction, select: discord.ui.UserSelect):
+        gone = {u.id for u in select.values}
+        self.cfg["allowed"] = [u for u in self.cfg["allowed"] if u not in gone]
+        await self.cog.save_cfg(self.guild_id, self.cfg)
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+
 # ═══════════════════════════ LE COG ═══════════════════════════
 class Giveaway(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -1217,7 +1269,6 @@ class Giveaway(commands.Cog):
         self.db: DB = None  # type: ignore[assignment]
         self.dirty: set[int] = set()
         self._cfg: dict[int, dict] = {}
-        self._owners: Optional[set[int]] = None
 
     # ── cycle de vie
     async def cog_load(self) -> None:
@@ -1230,32 +1281,16 @@ class Giveaway(commands.Cog):
         if self.db:
             self.db.close()
 
-    # ── accès
-    async def owner_ids(self) -> set[int]:
-        if self._owners is None:
-            ids: set[int] = set()
-            try:
-                info = await self.bot.application_info()
-                if info.team:
-                    ids.update(m.id for m in info.team.members)
-                    ids.add(info.team.owner_id)
-                elif info.owner:
-                    ids.add(info.owner.id)
-            except discord.HTTPException:
-                pass
-            self._owners = ids
-        return self._owners | EXTRA_ADMINS
+    # ── accès : uniquement le propriétaire + les personnes qu'il a ajoutées (par serveur)
+    @staticmethod
+    def is_owner(user_id: int) -> bool:
+        return user_id in OWNER_IDS
 
-    async def is_manager(self, member: discord.Member, guild: discord.Guild) -> bool:
-        if member.id in await self.owner_ids() or member.id == guild.owner_id:
-            return True
-        if STRICT:
-            return False
-        perms = member.guild_permissions
-        if perms.administrator or perms.manage_guild:
+    async def is_manager(self, member: discord.abc.User, guild: discord.Guild) -> bool:
+        if self.is_owner(member.id):
             return True
         cfg = await self.get_cfg(guild.id)
-        return any(r.id in cfg["managers"] for r in member.roles)
+        return member.id in cfg["allowed"]
 
     # ── config
     async def get_cfg(self, guild_id: int) -> dict:
@@ -1301,7 +1336,7 @@ class Giveaway(commands.Cog):
     @app_commands.guild_only()
     async def giveaway_cmd(self, interaction: discord.Interaction) -> None:
         if not await self.is_manager(interaction.user, interaction.guild):
-            return await interaction.response.send_message("⛔ Tu n'as pas accès à la gestion des giveaways.", ephemeral=True)
+            return await interaction.response.send_message("⛔ La gestion des giveaways est réservée.", ephemeral=True)
         embed, view = await self.panel(interaction)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
@@ -1325,6 +1360,7 @@ class Giveaway(commands.Cog):
                 "**🗂️ Historique** : relancer un tirage, supprimer\n"
                 "**⚙️ Configuration** : salon, mention, apparence, rôles gestionnaires\n"
                 "**🚫 Blacklist** : exclure des membres"
+                + ("\n**🔑 Accès** : donner l'accès au panneau à d'autres personnes" if self.is_owner(interaction.user.id) else "")
             ),
             color=discord.Color.gold(),
         )
