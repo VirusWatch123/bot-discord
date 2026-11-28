@@ -1,15 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-boutique.py — Boutique ultra développée, reliée à l'argent du bot (les rubis).
+boutique.py — Boutique style DraftBot, reliée à l'argent du bot (les rubis).
 
-UNE SEULE commande : /shop  → ouvre une interface (même style que /eco) avec :
-  • Parcourir la boutique (catégories, pages, achat avec confirmation)
-  • Inventaire (+ revente configurable)
-  • Populaires, Aide
-  • Administration (réservée à l'admin du bot) :
-        ➕ créer un article · ✏️ modifier · 🎭 lier à un rôle Discord (permanent ou temporaire)
-        🔒 rôle requis · 📦 stock · limite par membre · 🎁 donner / 🧹 retirer un article
-        ⚙️ réglages (nom, ouverte/fermée, % de revente, salon de logs)
+DEUX commandes seulement :
+  /shop       → affiche la boutique (catalogue, achat avec confirmation, inventaire, revente)
+  /shopadmin  → même interface mais ADMIN : créer des articles, vendre des rôles, gérer le stock,
+                lier un article à un rôle Discord (permanent ou temporaire), donner/retirer un article,
+                réglages, et 📢 publier la boutique dans un salon (bouton « Ouvrir la boutique »).
+
+Un article peut :
+  🎭 faire GAGNER un rôle Discord (permanent ou X jours, retiré tout seul à la fin)
+  💰 faire GAGNER des rubis (pack instantané) — en plus ou à la place d'un rôle
+  📦 être un simple objet d'inventaire (livré par un admin)
+…et être limité : stock, limite par membre, rôle requis pour acheter.
 
 ─── Installation ────────────────────────────────────────────────────────────────
 1) Mets ce fichier à côté de ton bot, puis dans ton fichier principal, AVANT tree.sync() :
@@ -26,6 +29,9 @@ UNE SEULE commande : /shop  → ouvre une interface (même style que /eco) avec 
 4) Liaison avec l'argent : le fichier cherche tout seul la table des rubis dans ta base
    SQLite. Si ça ne la trouve pas, renseigne ECO_DB_PATH / ECO_TABLE / ECO_COL_* ci-dessous
    (ou en variables d'environnement).
+
+5) Pour donner des rôles : le rôle du bot doit avoir « Gérer les rôles » et être placé
+   AU-DESSUS des rôles vendus dans Paramètres du serveur → Rôles.
 
 Dépendances : discord.py >= 2.3   (+ flask optionnel pour le keep alive, python-dotenv optionnel)
 """
@@ -54,7 +60,7 @@ SHOP_DB = os.getenv("SHOP_DB_PATH", "boutique.db")   # base propre à la boutiqu
 ADMIN_IDS = {1572724368029646999}                    # + la personne qui a invité le bot
 CURRENCY = "rubis"
 EMBED_COLOR = 0xF1C40F
-AUTO_SYNC = True        # synchronise /shop automatiquement quand le fichier est chargé en extension
+AUTO_SYNC = True        # synchronise /shop et /shopadmin automatiquement (chargement en extension)
 
 # Liaison avec le système d'argent existant (laisser vide = détection automatique)
 ECO_DB_PATH = os.getenv("ECO_DB_PATH", "")           # ex : "economie.db"
@@ -105,6 +111,11 @@ def now() -> int:
     return int(time.time())
 
 
+def short(text: str, n: int) -> str:
+    text = (text or "").strip().replace("\n", " ")
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  PONT AVEC L'ARGENT DU BOT (rubis)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -124,7 +135,6 @@ class EcoBridge:
         except Exception:
             log.exception("Détection de l'économie impossible")
 
-    # ── détection ───────────────────────────────────────────────────────────
     def detect(self):
         if ECO_DB_PATH:
             paths = [ECO_DB_PATH]
@@ -168,11 +178,8 @@ class EcoBridge:
             log.warning("Aucune table d'argent trouvée : renseigne ECO_DB_PATH / ECO_TABLE.")
 
     def describe(self) -> str:
-        if not self.ready:
-            return "non détectée"
-        return f"{self.path} → {self.table} ({self.c_wallet})"
+        return f"{self.path} → {self.table} ({self.c_wallet})" if self.ready else "non détectée"
 
-    # ── accès ───────────────────────────────────────────────────────────────
     def _con(self):
         return sqlite3.connect(self.path, timeout=15)
 
@@ -182,6 +189,7 @@ class EcoBridge:
         return f'"{self.c_user}"=?', (uid,)
 
     def balance(self, gid: int, uid: int) -> tuple[int, int]:
+        """(portefeuille, banque)"""
         if not self.ready:
             return 0, 0
         w, p = self._where(gid, uid)
@@ -192,22 +200,6 @@ class EcoBridge:
         finally:
             con.close()
         return (int(row[0] or 0), int(row[1] or 0)) if row else (0, 0)
-
-    def rank(self, gid: int, uid: int) -> Optional[int]:
-        if not self.ready:
-            return None
-        total = f'COALESCE("{self.c_wallet}",0)' + (f' + COALESCE("{self.c_bank}",0)' if self.c_bank else "")
-        wal, bank = self.balance(gid, uid)
-        flt, params = ("", ())
-        if self.c_guild:
-            flt, params = f' AND "{self.c_guild}"=?', (gid,)
-        con = self._con()
-        try:
-            row = con.execute(f'SELECT COUNT(*)+1 FROM "{self.table}" WHERE ({total}) > ?{flt}',
-                              (wal + bank, *params)).fetchone()
-        finally:
-            con.close()
-        return int(row[0]) if row else None
 
     def debit(self, gid: int, uid: int, amount: int) -> bool:
         """Retire `amount` du portefeuille, de façon atomique. False si solde insuffisant."""
@@ -303,6 +295,7 @@ def init_db():
             role_id INTEGER,
             duration_days INTEGER NOT NULL DEFAULT 0,
             required_role_id INTEGER,
+            reward_rubis INTEGER NOT NULL DEFAULT 0,
             stock INTEGER NOT NULL DEFAULT -1,
             max_per_user INTEGER NOT NULL DEFAULT 0,
             enabled INTEGER NOT NULL DEFAULT 1,
@@ -335,6 +328,10 @@ def init_db():
             ts INTEGER NOT NULL
         );
         """)
+        try:  # migration d'une ancienne base sans cette colonne
+            con.execute("ALTER TABLE items ADD COLUMN reward_rubis INTEGER NOT NULL DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
         con.commit()
     finally:
         con.close()
@@ -355,7 +352,7 @@ def set_cfg(gid: int, **kw):
 
 
 ITEM_FIELDS = {"name", "description", "price", "emoji", "category", "role_id", "duration_days",
-               "required_role_id", "stock", "max_per_user", "enabled"}
+               "required_role_id", "reward_rubis", "stock", "max_per_user", "enabled"}
 
 
 def list_items(gid: int, enabled_only: bool = False) -> list[dict]:
@@ -457,27 +454,34 @@ def shop_stats(gid: int) -> dict:
 def tags(item: dict) -> list[str]:
     t = []
     if item["role_id"]:
-        t.append("🎭 rôle" + (f" · {item['duration_days']} j" if item["duration_days"] else ""))
+        t.append("🎭 Rôle" + (f" {item['duration_days']} j" if item["duration_days"] else ""))
+    if item["reward_rubis"] > 0:
+        t.append(f"💰 +{fmt(item['reward_rubis'])}")
     if item["stock"] == 0:
-        t.append("🚫 rupture")
+        t.append("🚫 Rupture")
     elif item["stock"] > 0:
-        t.append(f"📦 {item['stock']}")
+        t.append(f"📦 {item['stock']} restant(s)")
+    if item["required_role_id"]:
+        t.append("🔒 Rôle requis")
     if not item["enabled"]:
-        t.append("⛔ désactivé")
+        t.append("⛔ Masqué")
     return t
 
 
-def item_embed(guild: discord.Guild, item: dict, owned: int = 0, expires: Optional[int] = None,
-               admin: bool = False) -> discord.Embed:
+def item_embed(item: dict, owned: int = 0, expires: Optional[int] = None, admin: bool = False) -> discord.Embed:
     e = discord.Embed(title=f"{item['emoji']} {item['name']}",
                       description=item["description"] or "*Aucune description.*", color=EMBED_COLOR)
     e.add_field(name="Prix", value=fmt(item["price"]))
     if item["role_id"]:
-        e.add_field(name="Type", value=f"🎭 Rôle <@&{item['role_id']}>")
+        e.add_field(name="Récompense", value=f"🎭 Rôle <@&{item['role_id']}>")
         e.add_field(name="Durée", value=f"{item['duration_days']} jour(s)" if item["duration_days"] else "Permanent")
+    elif item["reward_rubis"] > 0:
+        e.add_field(name="Type", value="💰 Pack de rubis (instantané)")
     else:
-        e.add_field(name="Type", value="📦 Objet")
+        e.add_field(name="Type", value="📦 Objet d'inventaire")
         e.add_field(name="Limite / membre", value=str(item["max_per_user"]) if item["max_per_user"] else "Aucune")
+    if item["reward_rubis"] > 0:
+        e.add_field(name="Gain en rubis", value=f"+{fmt(item['reward_rubis'])}")
     e.add_field(name="Stock", value="∞" if item["stock"] < 0 else str(item["stock"]))
     e.add_field(name="Catégorie", value=item["category"])
     e.add_field(name="Vendus", value=str(item["sold"]))
@@ -548,7 +552,7 @@ async def show(interaction: discord.Interaction, embed: discord.Embed, view: Opt
 class Btn(discord.ui.Button):
     def __init__(self, label: str, cb: Callable[..., Awaitable], style=discord.ButtonStyle.secondary,
                  emoji: Optional[str] = None, row: Optional[int] = None, disabled: bool = False):
-        super().__init__(label=label, style=style, emoji=emoji, row=row, disabled=disabled)
+        super().__init__(label=label or None, style=style, emoji=emoji, row=row, disabled=disabled)
         self._cb = cb
 
     async def callback(self, interaction: discord.Interaction):
@@ -593,14 +597,15 @@ class ChanSel(discord.ui.ChannelSelect):
 
 
 class ItemListView(BaseView):
-    """Liste paginée d'articles avec menu de sélection et filtre par catégorie."""
-    PAGE_SIZE = 6
+    """Catalogue paginé (style DraftBot) : liste détaillée + menu de sélection + filtre par catégorie."""
+    PAGE_SIZE = 5
 
-    def __init__(self, cog, user, *, title: str, fetch: Callable[[], list[dict]], on_pick, on_back,
-                 empty: str, intro: str = "", footer: Callable[[], str] = lambda: "", categories: bool = True):
-        super().__init__(cog, user)
-        self.title, self.fetch, self.on_pick, self.on_back = title, fetch, on_pick, on_back
-        self.empty, self.intro, self.footer, self.use_cat = empty, intro, footer, categories
+    def __init__(self, cog, user, *, title: str, fetch: Callable[[], list[dict]], on_pick,
+                 extra: Callable[[], list], empty: str, intro: Callable[[], str] = lambda: "",
+                 categories: bool = True, thumb: Optional[str] = None, timeout: float = 300):
+        super().__init__(cog, user, timeout=timeout)
+        self.title, self.fetch, self.on_pick, self.extra = title, fetch, on_pick, extra
+        self.empty, self.intro, self.use_cat, self.thumb = empty, intro, categories, thumb
         self.page = 0
         self.category: Optional[str] = None
         self.build()
@@ -618,18 +623,23 @@ class ItemListView(BaseView):
         return items[self.page * self.PAGE_SIZE:(self.page + 1) * self.PAGE_SIZE]
 
     def embed(self) -> discord.Embed:
-        chunk = self.chunk()
         e = discord.Embed(title=self.title, color=EMBED_COLOR)
         lines = []
-        for i in chunk:
-            extra = " · ".join(tags(i))
+        for i in self.chunk():
             qty = f" ×{i['qty']}" if "qty" in i else ""
-            lines.append(f"{i['emoji']} **{i['name']}**{qty} — {fmt(i['price'])}" + (f"\n└ {extra}" if extra else ""))
-        body = "\n".join(lines) if lines else self.empty
-        e.description = (self.intro + "\n\n" if self.intro else "") + body
-        foot = self.footer()
+            block = f"{i['emoji']} **{i['name']}**{qty} — **{fmt(i['price'])}**"
+            if i["description"]:
+                block += f"\n{short(i['description'], 90)}"
+            extra = " · ".join(tags(i))
+            if extra:
+                block += f"\n└ {extra}"
+            lines.append(block)
+        intro = self.intro()
+        e.description = (intro + "\n\n" if intro else "") + ("\n\n".join(lines) if lines else self.empty)
+        if self.thumb:
+            e.set_thumbnail(url=self.thumb)
         cat = f" · Catégorie : {self.category}" if self.category else ""
-        e.set_footer(text=f"Page {self.page + 1}/{self.pages()}{cat}" + (f" · {foot}" if foot else ""))
+        e.set_footer(text=f"Page {self.page + 1}/{self.pages()}{cat}")
         return e
 
     def build(self):
@@ -649,12 +659,9 @@ class ItemListView(BaseView):
                 self.add_item(Sel("Filtrer par catégorie", opts, self._cat, row=1))
         pages = self.pages()
         self.add_item(Btn("", self._prev, emoji="◀️", row=2, disabled=self.page <= 0))
-        self.add_item(Btn(f"{self.page + 1}/{pages}", self._noop, row=2, disabled=True))
         self.add_item(Btn("", self._next, emoji="▶️", row=2, disabled=self.page >= pages - 1))
-        self.add_item(Btn("Retour", self.on_back, style=discord.ButtonStyle.danger, emoji="↩️", row=2))
-
-    async def _noop(self, i, v):
-        pass
+        for item in self.extra():
+            self.add_item(item)
 
     async def _prev(self, i, v):
         self.page -= 1
@@ -687,7 +694,29 @@ class ConfirmView(BaseView):
         self.add_item(Btn("Annuler", on_no, style=discord.ButtonStyle.secondary, emoji="✖️"))
 
 
+class PublicShopView(discord.ui.View):
+    """Message public posté par l'admin : un bouton qui ouvre la boutique (visible par le clic seul).
+    Persistant : continue de marcher après un redémarrage du bot."""
+
+    def __init__(self, cog: "ShopCog"):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    @discord.ui.button(label="Ouvrir la boutique", emoji="🛒", style=discord.ButtonStyle.success,
+                       custom_id="boutique:open")
+    async def open_shop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.send_shop(interaction)
+
+
 # ── Formulaires ──────────────────────────────────────────────────────────────
+def _parse_stock(text: str) -> Optional[int]:
+    txt = (text or "").strip().lower()
+    if txt in ("", "∞", "illimité", "illimite", "-1"):
+        return -1
+    v = parse_int(txt)
+    return v if v is not None and v >= 0 else None
+
+
 class ItemInfoModal(discord.ui.Modal):
     def __init__(self, cog: "ShopCog", parent: discord.ui.View, item: Optional[dict]):
         super().__init__(title="Modifier l'article" if item else "Nouvel article")
@@ -707,12 +736,11 @@ class ItemInfoModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         name = self.f_name.value.strip()
         price = parse_int(self.f_price.value)
+        stock = _parse_stock(self.f_stock.value)
         if not name or price is None or not (0 <= price <= 10 ** 12):
             return await interaction.response.send_message(
                 "❌ Nom ou prix invalide (le prix doit être un nombre positif).", ephemeral=True)
-        txt = self.f_stock.value.strip().lower()
-        stock = -1 if txt in ("", "∞", "illimité", "illimite", "-1") else parse_int(txt)
-        if stock is None or stock < -1:
+        if stock is None:
             return await interaction.response.send_message("❌ Stock invalide.", ephemeral=True)
         emoji = clean_emoji(self.f_emoji.value)
         desc = self.f_desc.value.strip()
@@ -724,6 +752,32 @@ class ItemInfoModal(discord.ui.Modal):
         await self.cog.open_editor(interaction, item_id, old=self.parent)
 
 
+class RoleItemModal(discord.ui.Modal):
+    """Raccourci DraftBot : vendre un rôle en 1 formulaire."""
+
+    def __init__(self, cog: "ShopCog", parent: discord.ui.View, role: discord.Role):
+        super().__init__(title=f"Vendre le rôle {role.name}"[:45])
+        self.cog, self.parent, self.role = cog, parent, role
+        self.f_price = discord.ui.TextInput(label="Prix en rubis (ex : 5,000 ou 5k)", max_length=15, default="1000")
+        self.f_days = discord.ui.TextInput(label="Durée en jours (0 = permanent)", max_length=5, default="0",
+                                           required=False)
+        self.f_stock = discord.ui.TextInput(label="Stock (vide = illimité)", max_length=12, required=False)
+        self.f_desc = discord.ui.TextInput(label="Description (optionnel)", style=discord.TextStyle.paragraph,
+                                           required=False, max_length=300)
+        for f in (self.f_price, self.f_days, self.f_stock, self.f_desc):
+            self.add_item(f)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        price = parse_int(self.f_price.value)
+        days = parse_int(self.f_days.value or "0")
+        stock = _parse_stock(self.f_stock.value)
+        if price is None or not (0 <= price <= 10 ** 12) or days is None or not (0 <= days <= 3650) or stock is None:
+            return await interaction.response.send_message("❌ Prix, durée ou stock invalide.", ephemeral=True)
+        item_id = create_item(interaction.guild.id, self.role.name[:80], price, self.f_desc.value.strip(), "🎭", stock)
+        update_item(item_id, role_id=self.role.id, duration_days=days, category="Rôles")
+        await self.cog.open_editor(interaction, item_id, old=self.parent)
+
+
 class ItemOptionsModal(discord.ui.Modal):
     def __init__(self, cog: "ShopCog", parent: discord.ui.View, item: dict):
         super().__init__(title="Options de l'article")
@@ -731,18 +785,21 @@ class ItemOptionsModal(discord.ui.Modal):
         self.f_cat = discord.ui.TextInput(label="Catégorie", max_length=40, default=item["category"])
         self.f_days = discord.ui.TextInput(label="Durée du rôle en jours (0 = permanent)", max_length=6,
                                            default=str(item["duration_days"]), required=False)
-        self.f_max = discord.ui.TextInput(label="Limite par membre (0 = illimité)", max_length=6,
+        self.f_max = discord.ui.TextInput(label="Limite par membre, objets (0 = illimité)", max_length=6,
                                           default=str(item["max_per_user"]), required=False)
-        for f in (self.f_cat, self.f_days, self.f_max):
+        self.f_reward = discord.ui.TextInput(label="Rubis GAGNÉS à l'achat (0 = aucun)", max_length=15,
+                                             default=str(item["reward_rubis"]), required=False)
+        for f in (self.f_cat, self.f_days, self.f_max, self.f_reward):
             self.add_item(f)
 
     async def on_submit(self, interaction: discord.Interaction):
         days = parse_int(self.f_days.value or "0")
         mx = parse_int(self.f_max.value or "0")
-        if days is None or mx is None or days < 0 or mx < 0 or days > 3650:
+        reward = parse_int(self.f_reward.value or "0")
+        if None in (days, mx, reward) or days < 0 or mx < 0 or reward < 0 or days > 3650 or reward > 10 ** 12:
             return await interaction.response.send_message("❌ Valeurs invalides (nombres positifs).", ephemeral=True)
         update_item(self.item["id"], category=self.f_cat.value.strip() or "Général",
-                    duration_days=days, max_per_user=mx)
+                    duration_days=days, max_per_user=mx, reward_rubis=reward)
         await self.cog.open_editor(interaction, self.item["id"], old=self.parent)
 
 
@@ -781,6 +838,7 @@ class ShopCog(commands.Cog):
 
     async def cog_load(self):
         init_db()
+        self.bot.add_view(PublicShopView(self))
         self.expire_roles.start()
 
     async def cog_unload(self):
@@ -806,19 +864,28 @@ class ShopCog(commands.Cog):
             return False, f"Mon rôle doit être placé AU-DESSUS de {role.mention} dans la liste des rôles du serveur."
         return True, ""
 
-    # ── commande unique ─────────────────────────────────────────────────────
-    @app_commands.command(name="shop", description="Ouvre la boutique (achats, inventaire, administration)")
+    async def _deny(self, interaction):
+        await interaction.response.send_message("⛔ Réservé à l'administrateur du bot.", ephemeral=True)
+
+    # ── les DEUX commandes ──────────────────────────────────────────────────
+    @app_commands.command(name="shop", description="Affiche la boutique du serveur")
     @app_commands.guild_only()
     async def shop(self, interaction: discord.Interaction):
-        embed, view = await self.build_home(interaction.user)
+        await self.send_shop(interaction)
+
+    @app_commands.command(name="shopadmin", description="Administration de la boutique (admin du bot)")
+    @app_commands.guild_only()
+    async def shopadmin(self, interaction: discord.Interaction):
+        if not await self.is_admin(interaction.user):
+            return await self._deny(interaction)
+        embed, view = self.build_admin(interaction.user, interaction.guild)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         view.origin = interaction
 
     # ── tâche : retire les rôles temporaires expirés ───────────────────────
     @tasks.loop(seconds=60)
     async def expire_roles(self):
-        rows = q_all("SELECT * FROM role_grants WHERE expires_at<=?", (now(),))
-        for g in rows:
+        for g in q_all("SELECT * FROM role_grants WHERE expires_at<=?", (now(),)):
             guild = self.bot.get_guild(g["guild_id"])
             if guild is None:
                 continue
@@ -869,7 +936,8 @@ class ShopCog(commands.Cog):
                 return False, f"❌ {why}"
             if role in member.roles and not item["duration_days"]:
                 return False, "✅ Tu as déjà ce rôle."
-        elif item["max_per_user"] > 0 and inv_qty(guild.id, member.id, item_id) + qty > item["max_per_user"]:
+        elif item["reward_rubis"] <= 0 and item["max_per_user"] > 0 \
+                and inv_qty(guild.id, member.id, item_id) + qty > item["max_per_user"]:
             return False, f"🚫 Limite de **{item['max_per_user']}** par membre atteinte pour cet article."
 
         total = item["price"] * qty
@@ -893,18 +961,26 @@ class ShopCog(commands.Cog):
                 expires = base + item["duration_days"] * 86400
                 grant_set(guild.id, member.id, role.id, expires)
             inv_set(guild.id, member.id, item_id, 1)
-        else:
+        reward = item["reward_rubis"] * qty
+        if reward > 0:
+            self.eco.credit(guild.id, member.id, reward)
+        if not role and reward <= 0:
             inv_add(guild.id, member.id, item_id, qty)
         log_purchase(guild.id, member.id, item_id, item["name"], qty, total)
-        await self.send_log(guild, cfg, member, f"🛒 **{member}** a acheté **{qty}× {item['emoji']} {item['name']}** "
-                                                f"pour **{fmt(total)}**" + (f" (rôle {role.mention})" if role else
-                                                                           " — **à livrer si nécessaire**"))
-        msg = f"✅ Tu as acheté **{qty}× {item['emoji']} {item['name']}** pour **{fmt(total)}**."
+
+        what = f"**{qty}× {item['emoji']} {item['name']}**"
+        await self.send_log(guild, cfg, f"🛒 **{member}** a acheté {what} pour **{fmt(total)}**"
+                            + (f" · rôle {role.mention}" if role else "")
+                            + (f" · 💰 +{fmt(reward)}" if reward else "")
+                            + ("" if role or reward else " · **à livrer si nécessaire**"))
+        lines = [f"✅ Tu as acheté {what} pour **{fmt(total)}**."]
         if role:
-            msg += f"\n🎭 Rôle {role.mention} attribué" + (f" jusqu'à <t:{expires}:R>." if expires else ".")
-        else:
-            msg += "\n🎒 Ajouté à ton inventaire."
-        return True, msg
+            lines.append(f"🎭 Rôle {role.mention} gagné" + (f" jusqu'à <t:{expires}:R>." if expires else " !"))
+        if reward:
+            lines.append(f"💰 Tu gagnes **+{fmt(reward)}** !")
+        if not role and reward <= 0:
+            lines.append("🎒 Ajouté à ton inventaire.")
+        return True, "\n".join(lines)
 
     async def refund(self, member: discord.Member, item_id: int) -> tuple[bool, str]:
         guild = member.guild
@@ -923,12 +999,10 @@ class ShopCog(commands.Cog):
                 except discord.HTTPException:
                     return False, "❌ Je n'ai pas pu retirer le rôle (ma position est trop basse ?)."
             grant_delete(guild.id, member.id, item["role_id"])
-            inv_remove(guild.id, member.id, item_id, 1)
-        else:
-            inv_remove(guild.id, member.id, item_id, 1)
+        inv_remove(guild.id, member.id, item_id, 1)
         self.eco.credit(guild.id, member.id, amount)
-        await self.send_log(guild, cfg, member, f"💸 **{member}** a revendu **{item['emoji']} {item['name']}** "
-                                                f"et récupère **{fmt(amount)}**")
+        await self.send_log(guild, cfg, f"💸 **{member}** a revendu **{item['emoji']} {item['name']}** "
+                                        f"et récupère **{fmt(amount)}**")
         return True, f"✅ **{item['emoji']} {item['name']}** revendu : **+{fmt(amount)}**."
 
     async def admin_apply(self, guild: discord.Guild, mode: str, member: discord.Member, item_id: int,
@@ -937,6 +1011,7 @@ class ShopCog(commands.Cog):
         if not item:
             return "❌ Article introuvable."
         role = guild.get_role(item["role_id"]) if item["role_id"] else None
+        is_pack = not item["role_id"] and item["reward_rubis"] > 0
         if mode == "give":
             if item["role_id"]:
                 if role is None:
@@ -951,10 +1026,17 @@ class ShopCog(commands.Cog):
                 if item["duration_days"]:
                     grant_set(guild.id, member.id, role.id, now() + item["duration_days"] * 86400)
                 inv_set(guild.id, member.id, item_id, 1)
+                if item["reward_rubis"] > 0:
+                    self.eco.credit(guild.id, member.id, item["reward_rubis"])
                 return f"🎁 {member.mention} reçoit {item['emoji']} **{item['name']}** (rôle {role.mention})."
+            if is_pack:
+                self.eco.credit(guild.id, member.id, item["reward_rubis"] * qty)
+                return f"🎁 {member.mention} reçoit **+{fmt(item['reward_rubis'] * qty)}** ({item['name']})."
             inv_add(guild.id, member.id, item_id, qty)
             return f"🎁 {member.mention} reçoit **{qty}× {item['emoji']} {item['name']}**."
         # retirer
+        if is_pack:
+            return "❌ Un pack de rubis est instantané : il n'y a rien à retirer (utilise les commandes d'argent)."
         if inv_qty(guild.id, member.id, item_id) < 1 and not (role and role in member.roles):
             return f"❌ {member.mention} ne possède pas cet article."
         if role:
@@ -969,7 +1051,7 @@ class ShopCog(commands.Cog):
         inv_remove(guild.id, member.id, item_id, qty)
         return f"🧹 **{qty}× {item['emoji']} {item['name']}** retiré(s) à {member.mention}."
 
-    async def send_log(self, guild: discord.Guild, cfg, member, text: str):
+    async def send_log(self, guild: discord.Guild, cfg, text: str):
         if not cfg["log_channel"]:
             return
         ch = guild.get_channel(cfg["log_channel"])
@@ -982,95 +1064,68 @@ class ShopCog(commands.Cog):
             pass
 
     # ══════════════════════════════════════════════════════════════════════
-    #  ÉCRANS
+    #  /shop — LA BOUTIQUE
     # ══════════════════════════════════════════════════════════════════════
-    # ── Accueil ─────────────────────────────────────────────────────────────
-    async def build_home(self, member: discord.Member):
-        guild = member.guild
-        cfg = get_cfg(guild.id)
-        wallet, bank = self.eco.balance(guild.id, member.id)
-        rank = self.eco.rank(guild.id, member.id)
-        n_items = len(list_items(guild.id, enabled_only=True))
-        owned = sum(i["qty"] for i in inv_list(guild.id, member.id))
-        e = discord.Embed(title=f"🛒 {cfg['name']} : {member.display_name}",
-                          description="Choisis une action avec les boutons ci-dessous.", color=EMBED_COLOR)
-        e.add_field(name="Portefeuille", value=fmt(wallet))
-        e.add_field(name="Articles", value=str(n_items))
-        e.add_field(name="Inventaire", value=f"{owned} objet(s)")
-        if not self.eco.ready:
-            e.add_field(name="⚠️ Argent non relié", inline=False,
-                        value="Le système de rubis n'a pas été trouvé : renseigne `ECO_DB_PATH` / `ECO_TABLE` "
-                              "dans `boutique.py`.")
-        status = "🟢 Boutique ouverte" if cfg["is_open"] else "🔒 Boutique fermée"
-        refund = f"Revente à {cfg['refund_pct']} %" if cfg["refund_pct"] > 0 else "Revente désactivée"
-        e.set_footer(text=f"{status} · {refund}" + (f" · Classement #{rank}" if rank else ""))
-
-        v = BaseView(self, member)
-        v.add_item(Btn("Parcourir la boutique", self._h_browse, discord.ButtonStyle.success, "🛍️", row=0))
-        v.add_item(Btn("Inventaire", self._h_inv, discord.ButtonStyle.primary, "🎒", row=0))
-        v.add_item(Btn("Populaires", self._h_pop, discord.ButtonStyle.secondary, "🔥", row=0))
-        v.add_item(Btn("Aide", self._h_help, discord.ButtonStyle.secondary, "❓", row=1))
-        if await self.is_admin(member):
-            v.add_item(Btn("Administration", self._h_admin, discord.ButtonStyle.secondary, "⚙️", row=1))
-        v.add_item(Btn("Fermer", self._h_close, discord.ButtonStyle.danger, "✖️", row=1))
-        return e, v
-
-    async def open_home(self, interaction, old=None):
-        e, v = await self.build_home(interaction.user)
-        await show(interaction, e, v, old=old)
-
-    async def _h_browse(self, i, v): await self.open_browse(i, old=v)
-    async def _h_inv(self, i, v): await self.open_inventory(i, old=v)
-    async def _h_pop(self, i, v): await self.open_popular(i, old=v)
-    async def _h_help(self, i, v): await self.open_help(i, old=v)
-    async def _h_admin(self, i, v): await self.open_admin(i, old=v)
-
-    async def _h_close(self, i, v):
-        v.stop()
-        await i.response.edit_message(content="🛒 Boutique fermée. Tape **/shop** pour la rouvrir.",
-                                      embed=None, view=None)
-
-    async def _back_home(self, i, v):
-        await self.open_home(i, old=v)
-
-    # ── Aide / Populaires ──────────────────────────────────────────────────
-    async def open_help(self, interaction, old=None):
-        cfg = get_cfg(interaction.guild.id)
-        e = discord.Embed(title="❓ Aide de la boutique", color=EMBED_COLOR, description=(
-            f"• **Parcourir** : choisis un article, puis **Acheter**. Tu paies avec ton **portefeuille** ({CURRENCY}).\n"
-            "• **Rôles** : certains articles donnent un rôle Discord (parfois temporaire, il disparaît alors tout seul).\n"
-            "• **Objets** : ils vont dans ton **inventaire** ; un admin peut te les livrer ou les utiliser avec toi.\n"
-            + (f"• **Revente** : tu récupères **{cfg['refund_pct']} %** du prix depuis ton inventaire.\n"
-               if cfg["refund_pct"] > 0 else "• La revente est désactivée.\n")
-            + "• Un article peut être limité en stock, par membre, ou réservé à un rôle."))
-        v = BaseView(self, interaction.user)
-        v.add_item(Btn("Retour", self._back_home, discord.ButtonStyle.danger, "↩️"))
-        await show(interaction, e, v, old=old)
-
-    async def open_popular(self, interaction, old=None):
-        rows = q_all("SELECT * FROM items WHERE guild_id=? AND enabled=1 AND sold>0 ORDER BY sold DESC LIMIT 5",
-                     (interaction.guild.id,))
-        text = "\n".join(f"**{n}.** {r['emoji']} **{r['name']}** — {r['sold']} vendu(s) · {fmt(r['price'])}"
-                         for n, r in enumerate(rows, 1)) or "Aucune vente pour le moment."
-        e = discord.Embed(title="🔥 Articles populaires", description=text, color=EMBED_COLOR)
-        v = BaseView(self, interaction.user)
-        v.add_item(Btn("Retour", self._back_home, discord.ButtonStyle.danger, "↩️"))
-        await show(interaction, e, v, old=old)
-
-    # ── Boutique ───────────────────────────────────────────────────────────
-    async def open_browse(self, interaction, old=None):
-        guild, member = interaction.guild, interaction.user
+    def build_browse(self, member: discord.Member, guild: discord.Guild):
         cfg = get_cfg(guild.id)
 
         async def on_pick(i, item, v):
             await self.open_item(i, item["id"], old=v, mode="shop")
 
-        view = ItemListView(
-            self, member, title=f"🛍️ {cfg['name']}", fetch=lambda: list_items(guild.id, enabled_only=True),
-            on_pick=on_pick, on_back=self._back_home, empty="La boutique est vide pour le moment.",
-            intro="" if cfg["is_open"] else "🔒 **La boutique est fermée** : tu peux regarder mais pas acheter.",
-            footer=lambda: f"Portefeuille : {fmt(self.eco.balance(guild.id, member.id)[0])}")
-        await show(interaction, view.embed(), view, old=old)
+        def extra():
+            return [Btn("Inventaire", self._to_inv, discord.ButtonStyle.primary, "🎒", row=2),
+                    Btn("Aide", self._to_help, discord.ButtonStyle.secondary, "❓", row=2),
+                    Btn("Fermer", self._close, discord.ButtonStyle.danger, "✖️", row=2)]
+
+        def intro():
+            wallet, _ = self.eco.balance(guild.id, member.id)
+            txt = f"💰 Ton portefeuille : **{fmt(wallet)}**"
+            if not cfg_open():
+                txt = "🔒 **La boutique est fermée** : tu peux regarder, pas acheter.\n" + txt
+            if not self.eco.ready:
+                txt += "\n⚠️ Système d'argent non relié (voir `ECO_DB_PATH` dans `boutique.py`)."
+            return txt
+
+        def cfg_open():
+            return bool(get_cfg(guild.id)["is_open"])
+
+        view = ItemListView(self, member, title=f"🛒 {cfg['name']}",
+                            fetch=lambda: list_items(guild.id, enabled_only=True), on_pick=on_pick, extra=extra,
+                            empty="*La boutique est vide pour le moment.*", intro=intro,
+                            thumb=guild.icon.url if guild.icon else None)
+        return view.embed(), view
+
+    async def send_shop(self, interaction: discord.Interaction):
+        e, v = self.build_browse(interaction.user, interaction.guild)
+        await interaction.response.send_message(embed=e, view=v, ephemeral=True)
+        v.origin = interaction
+
+    async def open_browse(self, interaction, old=None):
+        e, v = self.build_browse(interaction.user, interaction.guild)
+        await show(interaction, e, v, old=old)
+
+    async def _to_browse(self, i, v): await self.open_browse(i, old=v)
+    async def _to_inv(self, i, v): await self.open_inventory(i, old=v)
+    async def _to_help(self, i, v): await self.open_help(i, old=v)
+
+    async def _close(self, i, v):
+        v.stop()
+        await i.response.edit_message(content="🛒 Boutique fermée. Tape **/shop** pour la rouvrir.",
+                                      embed=None, view=None)
+
+    async def open_help(self, interaction, old=None):
+        cfg = get_cfg(interaction.guild.id)
+        e = discord.Embed(title="❓ Aide de la boutique", color=EMBED_COLOR, description=(
+            f"• Choisis un article dans le menu, puis **Acheter**. Tu paies avec ton **portefeuille** ({CURRENCY}).\n"
+            "• 🎭 **Rôles** : tu gagnes un rôle Discord (parfois temporaire : il disparaît tout seul).\n"
+            "• 💰 **Packs** : tu gagnes des rubis instantanément.\n"
+            "• 📦 **Objets** : ils vont dans ton inventaire ; un admin peut te les livrer.\n"
+            + (f"• 💸 **Revente** : tu récupères **{cfg['refund_pct']} %** du prix depuis ton inventaire.\n"
+               if cfg["refund_pct"] > 0 else "• La revente est désactivée.\n")
+            + "• Un article peut être limité : stock, quantité par membre, ou réservé à un rôle."))
+        v = BaseView(self, interaction.user)
+        v.add_item(Btn("Retour", self._to_browse, discord.ButtonStyle.danger, "↩️"))
+        await show(interaction, e, v, old=old)
 
     async def open_item(self, interaction, item_id: int, old=None, mode: str = "shop"):
         guild, member = interaction.guild, interaction.user
@@ -1081,10 +1136,10 @@ class ShopCog(commands.Cog):
         cfg = get_cfg(guild.id)
         owned = inv_qty(guild.id, member.id, item_id)
         expires = grant_get(guild.id, member.id, item["role_id"]) if item["role_id"] else None
-        e = item_embed(guild, item, owned=owned, expires=expires)
+        e = item_embed(item, owned=owned, expires=expires)
         v = BaseView(self, member)
         if mode == "shop":
-            can_buy = cfg["is_open"] and item["stock"] != 0
+            can_buy = bool(cfg["is_open"]) and item["stock"] != 0
             v.add_item(Btn("Acheter", lambda i, vv: self.ask_buy(i, item_id, 1, old=vv),
                            discord.ButtonStyle.success, "🛒", row=0, disabled=not can_buy))
             if not item["role_id"]:
@@ -1092,7 +1147,7 @@ class ShopCog(commands.Cog):
                     await i.response.send_modal(QtyModal(vv, "Combien en acheter ?",
                                                          lambda ii, q, p: self.ask_buy(ii, item_id, q, old=p)))
                 v.add_item(Btn("Quantité…", qty_modal, discord.ButtonStyle.primary, "🔢", row=0, disabled=not can_buy))
-            v.add_item(Btn("Retour", lambda i, vv: self.open_browse(i, old=vv), discord.ButtonStyle.danger, "↩️", row=0))
+            v.add_item(Btn("Retour", self._to_browse, discord.ButtonStyle.danger, "↩️", row=0))
         else:
             if cfg["refund_pct"] > 0:
                 amount = item["price"] * cfg["refund_pct"] // 100
@@ -1111,7 +1166,7 @@ class ShopCog(commands.Cog):
         e = discord.Embed(title="🧾 Confirmer l'achat", color=EMBED_COLOR,
                           description=f"Acheter **{qty}× {item['emoji']} {item['name']}** pour **{fmt(total)}** ?")
         e.add_field(name="Portefeuille", value=fmt(wallet))
-        e.add_field(name="Après l'achat", value=fmt(max(wallet - total, 0)) if wallet >= total else "❌ Solde insuffisant")
+        e.add_field(name="Après l'achat", value=fmt(wallet - total) if wallet >= total else "❌ Solde insuffisant")
 
         async def yes(i, v):
             await i.response.defer()
@@ -1149,12 +1204,10 @@ class ShopCog(commands.Cog):
         wallet, _ = self.eco.balance(interaction.guild.id, interaction.user.id)
         e.set_footer(text=f"Portefeuille : {fmt(wallet)}")
         v = BaseView(self, interaction.user)
-        v.add_item(Btn("Continuer", lambda i, vv: self.open_browse(i, old=vv), discord.ButtonStyle.success, "🛍️"))
-        v.add_item(Btn("Inventaire", lambda i, vv: self.open_inventory(i, old=vv), discord.ButtonStyle.primary, "🎒"))
-        v.add_item(Btn("Menu", self._back_home, discord.ButtonStyle.secondary, "🏠"))
+        v.add_item(Btn("Continuer", self._to_browse, discord.ButtonStyle.success, "🛍️"))
+        v.add_item(Btn("Inventaire", self._to_inv, discord.ButtonStyle.primary, "🎒"))
         await show(interaction, e, v, old=old)
 
-    # ── Inventaire ─────────────────────────────────────────────────────────
     async def open_inventory(self, interaction, old=None):
         guild, member = interaction.guild, interaction.user
         cfg = get_cfg(guild.id)
@@ -1164,62 +1217,110 @@ class ShopCog(commands.Cog):
 
         view = ItemListView(
             self, member, title=f"🎒 Inventaire : {member.display_name}",
-            fetch=lambda: inv_list(guild.id, member.id), on_pick=on_pick, on_back=self._back_home,
-            empty="Ton inventaire est vide. Va faire un tour en boutique !", categories=False,
-            intro=(f"Sélectionne un article pour le revendre ({cfg['refund_pct']} % du prix)."
+            fetch=lambda: inv_list(guild.id, member.id), on_pick=on_pick,
+            extra=lambda: [Btn("Retour", self._to_browse, discord.ButtonStyle.danger, "↩️", row=2)],
+            empty="*Ton inventaire est vide. Va faire un tour en boutique !*", categories=False,
+            intro=(lambda: f"Sélectionne un article pour le revendre ({cfg['refund_pct']} % du prix)."
                    if cfg["refund_pct"] > 0 else ""))
         await show(interaction, view.embed(), view, old=old)
 
     # ══════════════════════════════════════════════════════════════════════
-    #  ADMINISTRATION
+    #  /shopadmin — ADMINISTRATION
     # ══════════════════════════════════════════════════════════════════════
-    async def _deny(self, interaction):
-        await interaction.response.send_message("⛔ Réservé à l'administrateur du bot.", ephemeral=True)
-
-    async def open_admin(self, interaction, old=None):
-        if not await self.is_admin(interaction.user):
-            return await self._deny(interaction)
-        guild = interaction.guild
+    def build_admin(self, member: discord.Member, guild: discord.Guild):
         cfg = get_cfg(guild.id)
         items = list_items(guild.id)
         st = shop_stats(guild.id)
-        e = discord.Embed(title="⚙️ Administration de la boutique", color=EMBED_COLOR,
-                          description="Crée et gère tes articles, lie-les à des rôles, règle la boutique.")
-        e.add_field(name="Articles", value=f"{sum(1 for i in items if i['enabled'])} actifs / {len(items)}")
-        e.add_field(name="Rôles liés", value=str(sum(1 for i in items if i["role_id"])))
+        lines = []
+        for i in items[:10]:
+            extra = " · ".join(tags(i))
+            lines.append(f"`#{i['id']}` {i['emoji']} **{i['name']}** — {fmt(i['price'])}" + (f"\n└ {extra}" if extra else ""))
+        if len(items) > 10:
+            lines.append(f"*… et {len(items) - 10} autre(s)*")
+        e = discord.Embed(title=f"⚙️ Administration : {cfg['name']}", color=EMBED_COLOR,
+                          description="\n".join(lines) if lines else
+                          "*Aucun article pour l'instant.*\nUtilise **🎭 Vendre un rôle** ou **➕ Créer un article**.")
         e.add_field(name="État", value="🟢 Ouverte" if cfg["is_open"] else "🔒 Fermée")
-        e.add_field(name="Ventes", value=f"{st['units']} article(s) · {st['orders']} commande(s)")
+        e.add_field(name="Articles", value=f"{sum(1 for i in items if i['enabled'])} actifs / {len(items)}")
+        e.add_field(name="Revente", value=f"{cfg['refund_pct']} %" if cfg["refund_pct"] else "Désactivée")
+        e.add_field(name="Ventes", value=f"{st['units']} article(s)")
         e.add_field(name="Revenus", value=fmt(st["revenue"]))
-        e.add_field(name="Revente", value=f"{cfg['refund_pct']} %")
         if st["top"]:
-            e.add_field(name="🔥 Top ventes", inline=False,
-                        value="\n".join(f"{t['emoji']} {t['name']} — {t['sold']}" for t in st["top"][:3]))
+            e.add_field(name="🔥 Top", value=", ".join(f"{t['emoji']} {t['name']} ({t['sold']})" for t in st["top"][:3]))
         e.set_footer(text=f"Argent lié : {self.eco.describe()}")
 
-        v = BaseView(self, interaction.user, timeout=600)
+        v = BaseView(self, member, timeout=600)
 
         async def add(i, vv):
             await i.response.send_modal(ItemInfoModal(self, vv, None))
 
-        v.add_item(Btn("Ajouter un article", add, discord.ButtonStyle.success, "➕", row=0))
-        v.add_item(Btn("Gérer les articles", lambda i, vv: self.open_admin_pick(i, "edit", old=vv),
+        async def publish(i, vv):
+            ch = i.channel
+            pe = discord.Embed(title=f"🛒 {get_cfg(guild.id)['name']}", color=EMBED_COLOR, description=(
+                f"Découvre les articles du serveur : **rôles**, **bonus** et **objets**, payables avec tes **{CURRENCY}**.\n\n"
+                "Clique sur le bouton ci-dessous pour ouvrir la boutique (visible par toi seul)."))
+            if guild.icon:
+                pe.set_thumbnail(url=guild.icon.url)
+            try:
+                await ch.send(embed=pe, view=PublicShopView(self))
+            except (discord.HTTPException, AttributeError):
+                return await i.response.send_message("❌ Je ne peux pas écrire dans ce salon.", ephemeral=True)
+            await i.response.send_message(f"📢 Boutique publiée dans {ch.mention}.", ephemeral=True)
+
+        async def close(i, vv):
+            vv.stop()
+            await i.response.edit_message(content="⚙️ Administration fermée.", embed=None, view=None)
+
+        v.add_item(Btn("Vendre un rôle", lambda i, vv: self.open_role_adder(i, old=vv),
+                       discord.ButtonStyle.success, "🎭", row=0))
+        v.add_item(Btn("Créer un article", add, discord.ButtonStyle.success, "➕", row=0))
+        v.add_item(Btn("Modifier", lambda i, vv: self.open_admin_pick(i, "edit", old=vv),
                        discord.ButtonStyle.primary, "✏️", row=0))
-        v.add_item(Btn("Réglages", lambda i, vv: self.open_settings(i, old=vv), discord.ButtonStyle.secondary, "⚙️", row=0))
-        v.add_item(Btn("Donner un article", lambda i, vv: self.open_admin_pick(i, "give", old=vv),
+        v.add_item(Btn("Donner", lambda i, vv: self.open_admin_pick(i, "give", old=vv),
                        discord.ButtonStyle.secondary, "🎁", row=1))
-        v.add_item(Btn("Retirer un article", lambda i, vv: self.open_admin_pick(i, "take", old=vv),
+        v.add_item(Btn("Retirer", lambda i, vv: self.open_admin_pick(i, "take", old=vv),
                        discord.ButtonStyle.secondary, "🧹", row=1))
-        v.add_item(Btn("Retour", self._back_home, discord.ButtonStyle.danger, "↩️", row=1))
+        v.add_item(Btn("Réglages", lambda i, vv: self.open_settings(i, old=vv),
+                       discord.ButtonStyle.secondary, "⚙️", row=1))
+        v.add_item(Btn("Publier la boutique", publish, discord.ButtonStyle.primary, "📢", row=2))
+        v.add_item(Btn("Fermer", close, discord.ButtonStyle.danger, "✖️", row=2))
+        return e, v
+
+    async def open_admin(self, interaction, old=None):
+        if not await self.is_admin(interaction.user):
+            return await self._deny(interaction)
+        e, v = self.build_admin(interaction.user, interaction.guild)
         await show(interaction, e, v, old=old)
 
     async def _back_admin(self, i, v):
         await self.open_admin(i, old=v)
 
+    # ── Vendre un rôle (raccourci) ─────────────────────────────────────────
+    async def open_role_adder(self, interaction, old=None):
+        if not await self.is_admin(interaction.user):
+            return await self._deny(interaction)
+        e = discord.Embed(title="🎭 Vendre un rôle", color=EMBED_COLOR, description=(
+            "Choisis le rôle que les membres pourront **acheter**.\n\n"
+            "Je dois avoir la permission **Gérer les rôles** et mon rôle doit être placé "
+            "**au-dessus** du rôle vendu dans la liste des rôles du serveur."))
+
+        async def picked(i, role, vv):
+            ok, why = self.can_manage(i.guild, role)
+            if not ok:
+                return await i.response.send_message(f"❌ {why}", ephemeral=True)
+            await i.response.send_modal(RoleItemModal(self, vv, role))
+
+        v = BaseView(self, interaction.user, timeout=600)
+        v.add_item(RoleSel("Choisis le rôle à vendre…", picked, row=0))
+        v.add_item(Btn("Retour", self._back_admin, discord.ButtonStyle.danger, "↩️", row=1))
+        await show(interaction, e, v, old=old)
+
+    # ── Choix d'un article (modifier / donner / retirer) ──────────────────
     async def open_admin_pick(self, interaction, mode: str, old=None):
         if not await self.is_admin(interaction.user):
             return await self._deny(interaction)
         guild = interaction.guild
-        titles = {"edit": "✏️ Gérer les articles", "give": "🎁 Donner : choisis l'article",
+        titles = {"edit": "✏️ Modifier un article", "give": "🎁 Donner : choisis l'article",
                   "take": "🧹 Retirer : choisis l'article"}
 
         async def on_pick(i, item, v):
@@ -1229,9 +1330,9 @@ class ShopCog(commands.Cog):
                 await self.open_member_pick(i, item["id"], mode, old=v)
 
         view = ItemListView(self, interaction.user, title=titles[mode], fetch=lambda: list_items(guild.id),
-                            on_pick=on_pick, on_back=self._back_admin,
-                            empty="Aucun article. Utilise ➕ **Ajouter un article**.")
-        view.timeout = 600
+                            on_pick=on_pick,
+                            extra=lambda: [Btn("Retour", self._back_admin, discord.ButtonStyle.danger, "↩️", row=2)],
+                            empty="*Aucun article. Utilise 🎭 Vendre un rôle ou ➕ Créer un article.*", timeout=600)
         await show(interaction, view.embed(), view, old=old)
 
     async def open_member_pick(self, interaction, item_id: int, mode: str, old=None):
@@ -1263,7 +1364,7 @@ class ShopCog(commands.Cog):
 
     async def show_admin_result(self, interaction, msg: str, old=None):
         e = discord.Embed(title="⚙️ Administration", description=msg,
-                          color=0x2ECC71 if not msg.startswith("❌") else 0xE74C3C)
+                          color=0xE74C3C if msg.startswith("❌") else 0x2ECC71)
         v = BaseView(self, interaction.user, timeout=600)
         v.add_item(Btn("Retour à l'administration", self._back_admin, discord.ButtonStyle.secondary, "⚙️"))
         await show(interaction, e, v, old=old)
@@ -1275,7 +1376,7 @@ class ShopCog(commands.Cog):
         item = get_item(item_id)
         if not item or item["guild_id"] != interaction.guild.id:
             return await self.open_admin(interaction, old=old)
-        e = item_embed(interaction.guild, item, admin=True)
+        e = item_embed(item, admin=True)
         v = BaseView(self, interaction.user, timeout=600)
 
         async def infos(i, vv):
@@ -1325,10 +1426,10 @@ class ShopCog(commands.Cog):
             await show(i, ev, ConfirmView(self, i.user, yes, no, "Supprimer", discord.ButtonStyle.danger), old=vv)
 
         v.add_item(Btn("Infos", infos, discord.ButtonStyle.primary, "✏️", row=0))
-        v.add_item(Btn("Options", options, discord.ButtonStyle.primary, "🛠️", row=0))
+        v.add_item(Btn("Options & gains", options, discord.ButtonStyle.primary, "🛠️", row=0))
         v.add_item(Btn("Masquer" if item["enabled"] else "Afficher", toggle,
                        discord.ButtonStyle.secondary, "🔴" if item["enabled"] else "🟢", row=0))
-        v.add_item(RoleSel("🎭 Lier à un rôle Discord (donné à l'achat)", link_role, row=1))
+        v.add_item(RoleSel("🎭 Rôle gagné à l'achat (lier à un rôle Discord)", link_role, row=1))
         v.add_item(RoleSel("🔒 Rôle requis pour pouvoir acheter (optionnel)", need_role, row=2))
         v.add_item(Btn("Délier le rôle", unlink, discord.ButtonStyle.secondary, "🎭", row=3, disabled=not item["role_id"]))
         v.add_item(Btn("Retirer la condition", unneed, discord.ButtonStyle.secondary, "🔓", row=3,
